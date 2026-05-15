@@ -14,13 +14,13 @@ Architecture (Phase 1)
   │                                                │
   │  ingest()  ──►  IngestCoordinator              │
   │                     │                          │
-  │                     ├──► EventParser           │
-  │                     ├──► DatabaseManager       │
-  │                     │       ├── RawEventStore  │
-  │                     │       ├── NodeStore  ◄───┼── in-memory name→UUID index
-  │                     │       └── EdgeStore      │
-  │                     ├──► GraphManager  ◄───────┼── NetworkX DiGraph (UUID keys)
-  │                     └──► RecentEventsBuffer    │
+  │                     ├─> EventParser            │
+  │                     ├─> DatabaseManager        │
+  │                     │       ├─ RawEventStore   │
+  │                     │       ├─ NodeStore  <────┼── in-memory name->UUID index
+  │                     │       └─ EdgeStore       │
+  │                     ├─> GraphManager  <────────┼── NetworkX DiGraph (UUID keys)
+  │                     └─> RecentEventsBuffer     │
   │                                                │
   │  reconstruct_context()  ──►  (Phase 1 stub)    │
   │    reads from buffer + DuckDB                  │
@@ -42,15 +42,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 from .config import EngineConfig
-from .schema import Context, CausalEdge, IncidentMatch, Remediation, EventKind
+from .schema import Context, CausalEdge, IncidentMatch, Remediation, EventKind, EdgeKind
 from .storage.database import DatabaseManager
 from .storage.raw_store import RawEventStore
 from .storage.node_store import NodeStore
 from .storage.edge_store import EdgeStore
+from .storage.pattern_store import PatternStore
+from .storage.remediation_store import RemediationStore, TemporalDecayScorer
 from .graph.manager import GraphManager
 from .ingestion.coordinator import IngestCoordinator
 from .ingestion.buffer import RecentEventsBuffer
 from .ingestion.parser import EventParser
+from .incident_fingerprinter import Fingerprinter, compute_similarity
 
 log = logging.getLogger(__name__)
 
@@ -73,6 +76,8 @@ class Engine:
         self._raw_store  = RawEventStore(self._db)
         self._node_store = NodeStore(self._db)
         self._edge_store = EdgeStore(self._db)
+        self._pattern_store = PatternStore(self._db)
+        self._remediation_store = RemediationStore(self._db)
 
         # In-memory graph
         self._graph  = GraphManager()
@@ -80,12 +85,18 @@ class Engine:
         # Hot buffer
         self._buffer = RecentEventsBuffer(self._cfg.buffer_size)
 
+        # Phase 2: fingerprinter and decay scorer
+        self._fingerprinter = Fingerprinter()
+        self._decay_scorer = TemporalDecayScorer()
+
         # Ingest pipeline
         self._coordinator = IngestCoordinator(
             db         = self._db,
             raw_store  = self._raw_store,
             node_store = self._node_store,
             edge_store = self._edge_store,
+            pattern_store = self._pattern_store,
+            remediation_store = self._remediation_store,
             graph      = self._graph,
             buffer     = self._buffer,
         )
@@ -116,16 +127,13 @@ class Engine:
         """
         Reconstruct operational context for an incident signal.
 
-        Phase 1 implementation
+        Phase 2 implementation
         ----------------------
-        Returns time-windowed related events from the ring buffer (fast
-        path) falling back to DuckDB, with empty causal_chain /
-        similar_past_incidents / suggested_remediations.
-
-        Phase 2+ will add:
-          * Causal inference from graph traversal
-          * Incident matching via behavioural fingerprints
-          * Remediation suggestion from historical outcomes
+        Returns complete Context with:
+          * related_events: time-windowed events from buffer/DB
+          * causal_chain: inferred cause-effect edges
+          * similar_past_incidents: behavioral pattern matches
+          * suggested_remediations: historical remediations with decay
         """
         parser = EventParser()
         try:
@@ -154,8 +162,14 @@ class Engine:
         if svc:
             anchor_services.append(svc)
         else:
-            trigger: str = normalised_signal.get("trigger", "")
-            anchor_services = self._extract_services_from_trigger(trigger)
+            trigger_str: str = normalised_signal.get("trigger", "")
+            anchor_services = self._extract_services_from_trigger(trigger_str)
+
+        # Resolve trigger service to node_id for pattern matching
+        trigger_node_id: Optional[str] = None
+        if anchor_services:
+            trigger_node_id = self._node_store.resolve(anchor_services[0])
+
         expanded_services = self._expand_services(anchor_services)
 
         # --- Fast path: ring buffer ----------------------------------
@@ -201,22 +215,57 @@ class Engine:
 
         deduped.sort(key=_sort_key)
 
-        # Normalise ts back to ISO string in every event so related_events
-        # always matches the benchmark's Event TypedDict (ts: str).
-        deduped = [self._normalise_event_for_output(e) for e in deduped]
-
-        # Build explain narrative
-        explain = self._build_explain(
-            normalised_signal, deduped, start_ts, end_ts
+        # --- Phase 2: Build causal chain --------------------------------
+        causal_chain = self._build_causal_chain(
+            deduped, trigger_node_id, normalised_signal.get("incident_id", "unknown")
         )
 
-        confidence = min(0.3 + 0.05 * len(deduped), 0.5) if deduped else 0.0
+        # --- Phase 2: Incident matching via fingerprint ------------------
+        similar_incidents: List[IncidentMatch] = []
+        fingerprint_hash = ""
+
+        if trigger_node_id:
+            # Extract fingerprint (BEFORE normalizing timestamps to strings)
+            fingerprint = self._fingerprinter.fingerprint(
+                trigger_node_id=trigger_node_id,
+                trigger_service=anchor_services[0] if anchor_services else "",
+                incident_ts=incident_ts,
+                events=deduped,
+                graph_manager=self._graph,
+                node_store=self._node_store,
+            )
+            fingerprint_hash = fingerprint.structural_hash
+
+            # Find similar past incidents
+            similar_incidents = self._find_similar_incidents(
+                fingerprint, trigger_node_id, mode
+            )
+
+        # --- Phase 2: Suggest remediations -------------------------------
+        suggested_remediations = self._suggest_remediations(
+            fingerprint_hash, trigger_node_id, similar_incidents
+        )
+
+        # Compute overall confidence
+        confidence = self._compute_overall_confidence(
+            len(deduped), len(causal_chain), len(similar_incidents)
+        )
+
+        # Build explain narrative
+        explain = self._build_explain_phase2(
+            normalised_signal, deduped, causal_chain, similar_incidents,
+            suggested_remediations
+        )
+
+        # Normalise ts back to ISO string in every event so related_events
+        # always matches the benchmark's Event TypedDict (ts: str).
+        normalized_events = [self._normalise_event_for_output(e) for e in deduped]
 
         return Context(
-            related_events         = deduped,
-            causal_chain           = [],         # Phase 2+
-            similar_past_incidents = [],          # Phase 2+
-            suggested_remediations = [],          # Phase 2+
+            related_events         = normalized_events,
+            causal_chain           = causal_chain,
+            similar_past_incidents = similar_incidents,
+            suggested_remediations = suggested_remediations,
             confidence             = round(confidence, 3),
             explain                = explain,
         )
@@ -277,7 +326,7 @@ class Engine:
         """
         Heuristically extract service names from a trigger string.
 
-        Example: "alert:checkout-api/error-rate>5%"  → ["checkout-api"]
+        Example: "alert:checkout-api/error-rate>5%"  returns ["checkout-api"]
         """
         if not trigger:
             return []
@@ -289,28 +338,347 @@ class Engine:
         tokens = re.findall(r"[a-zA-Z][a-zA-Z0-9_-]{2,}", trigger)
         return [t for t in tokens if t not in {"alert", "error", "rate", "warn"}]
 
+    # ------------------------------------------------------------------
+    # Phase 2: Causal chain inference
+    # ------------------------------------------------------------------
+
+    def _build_causal_chain(
+        self,
+        events: List[Dict[str, Any]],
+        trigger_node_id: Optional[str],
+        incident_id: str,
+    ) -> List[CausalEdge]:
+        """
+        Build causal edges from event sequence.
+
+        Rules:
+        1. Deploy leads to subsequent metric spike within 10 min
+        2. Shared trace_id implies causality
+        3. Graph edge (CALLS, DEPENDENCY) implies influence
+        """
+        chain: List[CausalEdge] = []
+        if not events or not trigger_node_id:
+            return chain
+
+        # Index events by ID and position
+        event_index: Dict[str, Dict[str, Any]] = {}
+        for i, ev in enumerate(events):
+            eid = ev.get("id") or ev.get("event_id") or f"evt_{i}"
+            event_index[eid] = ev
+            ev["_idx"] = i
+
+        # Build edges based on rules
+        for i, ev_a in enumerate(events):
+            ev_a_id = ev_a.get("id") or ev_a.get("event_id") or f"evt_{i}"
+            ev_a_ts = self._get_event_ts(ev_a)
+
+            for j, ev_b in enumerate(events[i+1:], start=i+1):
+                ev_b_id = ev_b.get("id") or ev_b.get("event_id") or f"evt_{j}"
+                ev_b_ts = self._get_event_ts(ev_b)
+
+                if ev_a_ts > ev_b_ts:
+                    continue  # Must be before
+
+                evidence, confidence = self._check_causality(
+                    ev_a, ev_b, trigger_node_id
+                )
+
+                if confidence > 0.0:
+                    chain.append(CausalEdge(
+                        cause_event_id=ev_a_id,
+                        effect_event_id=ev_b_id,
+                        evidence=evidence,
+                        confidence=round(confidence, 3),
+                    ))
+
+        # Sort by confidence descending, limit
+        chain.sort(key=lambda e: e["confidence"], reverse=True)
+        return chain[:10]
+
+    def _get_event_ts(self, event: Dict[str, Any]) -> datetime:
+        """Extract datetime from event, handling various formats."""
+        ts = event.get("ts")
+        if isinstance(ts, datetime):
+            return ts
+        if isinstance(ts, str):
+            try:
+                return EventParser._parse_timestamp(ts)
+            except Exception:
+                pass
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    def _check_causality(
+        self,
+        ev_a: Dict[str, Any],
+        ev_b: Dict[str, Any],
+        trigger_node_id: str,
+    ) -> Tuple[str, float]:
+        """
+        Check if ev_a could cause ev_b.
+
+        Returns (evidence_string, confidence).
+        """
+        kind_a = ev_a.get("kind", "")
+        kind_b = ev_b.get("kind", "")
+        svc_a = ev_a.get("service", "")
+        svc_b = ev_b.get("service", "")
+
+        ts_a = self._get_event_ts(ev_a)
+        ts_b = self._get_event_ts(ev_b)
+        time_diff_min = (ts_b - ts_a).total_seconds() / 60
+
+        # Rule 1: Deploy leads to metric spike within 10 min
+        if kind_a == "deploy" and kind_b == "metric":
+            if 0 < time_diff_min <= 10:
+                node_a = self._node_store.resolve(svc_a)
+                if node_a == trigger_node_id:
+                    return "deploy precedes metric spike within 10min", 0.8
+
+        # Rule 2: Shared trace_id
+        trace_a = ev_a.get("trace_id")
+        trace_b = ev_b.get("trace_id")
+        if trace_a and trace_a == trace_b:
+            return f"shared trace_id {trace_a}", 0.7
+
+        # Rule 3: Graph edge between services
+        node_a = self._node_store.resolve(svc_a)
+        node_b = self._node_store.resolve(svc_b)
+        if node_a and node_b and time_diff_min <= 5:
+            # Check if A calls B or A depends on B
+            if self._graph.graph.has_edge(node_a, node_b):
+                edge_data = self._graph.graph[node_a][node_b]
+                edge_kind = edge_data.get("edge_kind", "")
+                if edge_kind in (EdgeKind.CALLS, EdgeKind.DEPENDENCY, EdgeKind.ERROR_PROPAGATION):
+                    return f"{edge_kind} edge in graph", 0.6
+            # Reverse direction (error propagation)
+            if self._graph.graph.has_edge(node_b, node_a):
+                edge_data = self._graph.graph[node_b][node_a]
+                edge_kind = edge_data.get("edge_kind", "")
+                if edge_kind == EdgeKind.ERROR_PROPAGATION:
+                    return f"{edge_kind} edge in graph", 0.5
+
+        # Rule 4: Log error before metric spike (same service)
+        if kind_a == "log" and kind_b == "metric":
+            if svc_a == svc_b and 0 < time_diff_min <= 5:
+                level = ev_a.get("level", "").lower()
+                if level in ("error", "fatal", "critical"):
+                    return "error log precedes metric spike", 0.6
+
+        return "", 0.0
+
+    # ------------------------------------------------------------------
+    # Phase 2: Incident matching
+    # ------------------------------------------------------------------
+
+    def _find_similar_incidents(
+        self,
+        fingerprint: Any,  # IncidentFingerprint
+        trigger_node_id: str,
+        mode: str,
+    ) -> List[IncidentMatch]:
+        """
+        Find past incidents similar to the current fingerprint.
+
+        Uses exact hash match + soft matching (edit distance <= 1).
+        """
+        matches: List[IncidentMatch] = []
+
+        # Try exact hash match first (across all services for rename-proof matching)
+        similar = self._pattern_store.find_similar_patterns(
+            fingerprint.structural_hash,
+            trigger_node_id=None,  # Search across all services
+            limit=5,
+        )
+
+        seen_incidents: set = set()
+
+        for s in similar:
+            inc_id = s["incident_id"]
+            if inc_id in seen_incidents:
+                continue
+            seen_incidents.add(inc_id)
+
+            matches.append(IncidentMatch(
+                incident_id=inc_id,
+                similarity=round(s.get("similarity_score", 0.8), 3),
+                rationale=f"Exact fingerprint match in family {s.get('family_id', 'unknown')}",
+            ))
+
+        # If few matches and deep mode, try soft matching
+        if len(matches) < 3 and mode == "deep":
+            # Get all hashes and compute edit distances
+            all_hashes = self._pattern_store.get_all_hashes()
+            for h in all_hashes:
+                if h == fingerprint.structural_hash:
+                    continue  # Already checked
+                # Fetch patterns with this hash
+                patterns = self._pattern_store._cursor().execute(
+                    """SELECT incident_id, fingerprint_tuple, trigger_node_id
+                        FROM incident_patterns WHERE fingerprint_hash = ?""",
+                    [h]
+                ).fetchall()
+
+                for p in patterns:
+                    if p[0] in seen_incidents:
+                        continue
+                    # Parse tuple and compute edit distance
+                    try:
+                        other_elements = json.loads(p[1])
+                        from .incident_fingerprinter import IncidentFingerprint
+                        other_fp = IncidentFingerprint(
+                            elements=other_elements,
+                            structural_hash=h,
+                            trigger_node_id=p[2],
+                            window_start=datetime.min,
+                            window_end=datetime.min,
+                            event_count=len(other_elements),
+                        )
+                        dist = fingerprint.edit_distance(other_fp)
+                        if dist <= 1:
+                            similarity = 0.8 if dist == 0 else 0.6
+                            matches.append(IncidentMatch(
+                                incident_id=p[0],
+                                similarity=round(similarity, 3),
+                                rationale=f"Soft match (edit distance {dist})",
+                            ))
+                            seen_incidents.add(p[0])
+                            if len(matches) >= 5:
+                                break
+                    except Exception:
+                        continue
+                if len(matches) >= 5:
+                    break
+
+        return matches[:5]
+
+    # ------------------------------------------------------------------
+    # Phase 2: Remediation suggestion
+    # ------------------------------------------------------------------
+
+    def _suggest_remediations(
+        self,
+        fingerprint_hash: str,
+        trigger_node_id: Optional[str],
+        similar_incidents: List[IncidentMatch],
+    ) -> List[Remediation]:
+        """Suggest remediations based on historical outcomes."""
+        suggestions: List[Remediation] = []
+        if not trigger_node_id:
+            return suggestions
+
+        now = datetime.now(timezone.utc)
+
+        # Strategy 1: Look at remediations for similar incidents
+        seen_actions: set = set()
+
+        for match in similar_incidents:
+            pattern = self._pattern_store.get_pattern_by_incident(match["incident_id"])
+            if not pattern:
+                continue
+
+            rems = self._remediation_store.get_for_pattern(pattern["id"], limit=2)
+            for rem in rems:
+                action_key = f"{rem['action']}:{rem['target_node_id']}"
+                if action_key in seen_actions:
+                    continue
+                seen_actions.add(action_key)
+
+                # Apply temporal decay
+                decayed_conf = self._decay_scorer.compute(
+                    rem["confidence"], rem["applied_at"], now
+                )
+
+                # Boost if outcome was resolved
+                if rem["outcome"] == "resolved":
+                    decayed_conf = min(0.95, decayed_conf * 1.2)
+
+                suggestions.append(Remediation(
+                    action=rem["action"],
+                    target=rem["target_service"],  # Use canonical name, not UUID
+                    historical_outcome=rem["outcome"],
+                    confidence=round(decayed_conf, 3),
+                ))
+
+        # Strategy 2: Successful remediations for this target
+        if len(suggestions) < 3:
+            successful = self._remediation_store.get_successful_actions_for_target(
+                trigger_node_id, min_confidence=0.5, limit=3
+            )
+            for s in successful:
+                action_key = f"{s['action']}:{trigger_node_id}"
+                if action_key in seen_actions:
+                    continue
+                seen_actions.add(action_key)
+
+                decayed_conf = self._decay_scorer.compute(
+                    s["confidence"], s["applied_at"], now
+                )
+
+                target_name = self._node_store.get_canonical_name(trigger_node_id) or "unknown"
+                suggestions.append(Remediation(
+                    action=s["action"],
+                    target=target_name,
+                    historical_outcome="resolved",
+                    confidence=round(decayed_conf, 3),
+                ))
+
+        # Sort by confidence descending
+        suggestions.sort(key=lambda r: r["confidence"], reverse=True)
+        return suggestions[:3]
+
+    def _compute_overall_confidence(
+        self,
+        n_events: int,
+        n_causal: int,
+        n_similar: int,
+    ) -> float:
+        """Compute overall confidence score."""
+        base = 0.3
+        event_boost = min(0.2, n_events * 0.01)  # Up to 0.2 for many events
+        causal_boost = min(0.3, n_causal * 0.1)    # Up to 0.3 for strong causal chain
+        similar_boost = min(0.2, n_similar * 0.1)  # Up to 0.2 for similar incidents
+
+        return min(0.95, base + event_boost + causal_boost + similar_boost)
+
     @staticmethod
-    def _build_explain(
+    def _build_explain_phase2(
         signal: Dict[str, Any],
         events: List[Dict[str, Any]],
-        start_ts: datetime,
-        end_ts: datetime,
+        causal_chain: List[CausalEdge],
+        similar_incidents: List[IncidentMatch],
+        suggested_remediations: List[Remediation],
     ) -> str:
+        """Build Phase 2 explain narrative."""
         incident_id = signal.get("incident_id", "unknown")
-        trigger     = signal.get("trigger", "")
-        n_events    = len(events)
-        kinds       = {}
-        for e in events:
-            k = e.get("kind", "unknown")
-            kinds[k] = kinds.get(k, 0) + 1
-        kind_summary = ", ".join(f"{v}×{k}" for k, v in sorted(kinds.items()))
-        return (
-            f"[Phase 1] Incident {incident_id} triggered by '{trigger}'. "
-            f"Retrieved {n_events} related events in window "
-            f"[{start_ts.isoformat()}, {end_ts.isoformat()}]. "
-            f"Event breakdown: {kind_summary or 'none'}. "
-            "Causal inference and incident matching require Phase 2."
-        )
+        trigger = signal.get("trigger", "")
+
+        parts: List[str] = []
+        parts.append(f"Incident {incident_id} triggered by '{trigger}'.")
+        parts.append(f"Found {len(events)} related events in temporal window.")
+
+        if causal_chain:
+            top_edge = causal_chain[0]
+            parts.append(
+                f"Causal chain: {top_edge['evidence']} "
+                f"(confidence {top_edge['confidence']})."
+            )
+
+        if similar_incidents:
+            parts.append(
+                f"{len(similar_incidents)} similar past incidents found, "
+                f"most similar: {similar_incidents[0]['incident_id']} "
+                f"(score {similar_incidents[0]['similarity']})."
+            )
+
+        if suggested_remediations:
+            top_rem = suggested_remediations[0]
+            parts.append(
+                f"Suggested action: {top_rem['action']} on {top_rem['target']} "
+                f"(confidence {top_rem['confidence']}, "
+                f"historical outcome: {top_rem['historical_outcome']})."
+            )
+
+        return " ".join(parts)
 
     # ------------------------------------------------------------------
     # Diagnostics / introspection
@@ -325,4 +693,7 @@ class Engine:
             "graph_edges":   self._graph.edge_count(),
             "buffer_size":   len(self._buffer),
             "parser_stats":  self._coordinator.parser_stats(),
+            "patterns":      self._pattern_store.count(),
+            "families":      self._pattern_store.count_families(),
+            "remediations":  self._remediation_store.count(),
         }

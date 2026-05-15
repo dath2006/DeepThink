@@ -48,7 +48,7 @@ calls_edges = [e for e in edges if e["edge_kind"] == "calls"]
 print(f"\n=== Graph Edges ===")
 print(f"  Active CALLS edges for checkout-api: {len(calls_edges)}")
 assert len(calls_edges) >= 1, "FAIL: CALLS edge from trace was not created"
-print(f"  -> CALLS edge found: checkout-api → payments/billing-svc")
+print("  -> CALLS edge found: checkout-api -> payments/billing-svc")
 
 # Verify context reconstruction returns related events
 signal = {

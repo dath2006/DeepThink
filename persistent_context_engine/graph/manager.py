@@ -120,6 +120,47 @@ class GraphManager:
     # Traversal helpers  (used by context reconstruction, Phase 2+)
     # ------------------------------------------------------------------
 
+    def neighbors_at_hops(
+        self,
+        node_id: str,
+        max_hops: int = 2,
+    ) -> List[Tuple[str, str]]:
+        """
+        BFS returning (neighbor_id, direction) where direction is 'upstream'
+        (predecessor) or 'downstream' (successor) relative to the start node.
+
+        Used by fingerprinter to compute service roles (upstream-1, downstream-2, etc.)
+        """
+        result: List[Tuple[str, str]] = []
+        visited: Set[str] = {node_id}
+
+        # Track nodes at each hop level with their direction
+        current_level: Dict[str, str] = {node_id: "trigger"}
+
+        for hop in range(1, max_hops + 1):
+            next_level: Dict[str, str] = {}
+
+            for current_id, _ in current_level.items():
+                # Successors = downstream
+                for succ in self._g.successors(current_id):
+                    if succ not in visited:
+                        visited.add(succ)
+                        next_level[succ] = "downstream"
+                        result.append((succ, "downstream"))
+
+                # Predecessors = upstream
+                for pred in self._g.predecessors(current_id):
+                    if pred not in visited:
+                        visited.add(pred)
+                        next_level[pred] = "upstream"
+                        result.append((pred, "upstream"))
+
+            current_level = next_level
+            if not current_level:
+                break
+
+        return result
+
     def neighbors_within_hops(
         self,
         node_id: str,

@@ -157,6 +157,14 @@ class NodeStore:
             return []
         return [record["canonical_name"]] + record["aliases"]
 
+    def get_canonical_name(self, node_id: str) -> Optional[str]:
+        """Return the current canonical name for a node UUID."""
+        row = self._db.conn.cursor().execute(
+            "SELECT canonical_name FROM nodes WHERE id = ?",
+            [node_id],
+        ).fetchone()
+        return row[0] if row else None
+
     def count(self) -> int:
         return self._db.conn.cursor().execute(
             "SELECT COUNT(*) FROM nodes"

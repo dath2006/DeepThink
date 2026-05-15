@@ -146,6 +146,47 @@ class EdgeRecord(TypedDict):
     metadata:           Dict[str, Any]
 
 
+class IncidentPatternRecord(TypedDict):
+    """Internal storage for incident behavioral fingerprints."""
+    id:                 str           # UUID
+    incident_id:        str           # from incident_signal
+    fingerprint_hash:   str           # SHA-256 of canonical fingerprint
+    fingerprint_tuple:  str           # JSON array of fingerprint elements
+    trigger_node_id:    str           # UUID of triggering service
+    window_start_ts:    datetime
+    window_end_ts:      datetime
+    family_id:          Optional[str] # NULL until matched
+    similarity_score:   float         # 0..1, similarity to family centroid
+    event_count:        int
+    created_at:         datetime
+
+
+class IncidentFamilyRecord(TypedDict):
+    """A group of incidents sharing similar behavioral fingerprints."""
+    id:                    str       # UUID
+    family_hash:           str       # Representative fingerprint hash
+    representative_pattern_id: str     # Pattern that started this family
+    incident_count:        int       # How many incidents in this family
+    first_seen_ts:         datetime
+    last_confirmed_ts:     datetime  # Updated when new incident joins
+    reinforced_confidence: float     # Base confidence + reinforcement
+    decay_rate:            float     # 0.95 default
+
+
+class RemediationRecord(TypedDict):
+    """Historical remediation action with outcome."""
+    id:                 str       # UUID
+    incident_id:        str       # from incident_signal
+    pattern_id:         str       # UUID of matched pattern
+    action:             str       # rollback, restart, config_change, etc.
+    target_node_id:     str       # UUID (not service name!)
+    target_service:     str       # Canonical name at time of remediation
+    outcome:            str       # resolved, worsened, unknown
+    confidence:         float     # Historical success rate
+    applied_at:         datetime
+    evidence_event_ids: List[str] # Links to raw_events
+
+
 # ---------------------------------------------------------------------------
 # DuckDB DDL
 # ---------------------------------------------------------------------------
@@ -189,4 +230,55 @@ INDEX_DDL: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_e_src      ON edges(source_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_e_dst      ON edges(target_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_e_kind     ON edges(edge_kind)",
+]
+
+# Phase 2: Incident patterns and families DDL
+PATTERN_DDL = """
+CREATE TABLE IF NOT EXISTS incident_patterns (
+    id                  VARCHAR PRIMARY KEY,
+    incident_id         VARCHAR NOT NULL,
+    fingerprint_hash    VARCHAR NOT NULL,
+    fingerprint_tuple   VARCHAR NOT NULL,
+    trigger_node_id     VARCHAR NOT NULL,
+    window_start_ts     TIMESTAMPTZ NOT NULL,
+    window_end_ts       TIMESTAMPTZ NOT NULL,
+    family_id           VARCHAR,
+    similarity_score    DOUBLE NOT NULL DEFAULT 0.0,
+    event_count         INTEGER NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS incident_families (
+    id                      VARCHAR PRIMARY KEY,
+    family_hash             VARCHAR NOT NULL,
+    representative_pattern_id VARCHAR NOT NULL,
+    incident_count          INTEGER NOT NULL DEFAULT 0,
+    first_seen_ts           TIMESTAMPTZ NOT NULL,
+    last_confirmed_ts       TIMESTAMPTZ NOT NULL,
+    reinforced_confidence   DOUBLE NOT NULL DEFAULT 0.5,
+    decay_rate              DOUBLE NOT NULL DEFAULT 0.95
+);
+
+CREATE TABLE IF NOT EXISTS remediation_history (
+    id                  VARCHAR PRIMARY KEY,
+    incident_id         VARCHAR NOT NULL,
+    pattern_id          VARCHAR,
+    action              VARCHAR NOT NULL,
+    target_node_id      VARCHAR NOT NULL,
+    target_service      VARCHAR NOT NULL,
+    outcome             VARCHAR NOT NULL,
+    confidence          DOUBLE NOT NULL DEFAULT 0.0,
+    applied_at          TIMESTAMPTZ NOT NULL,
+    evidence_event_ids  VARCHAR NOT NULL DEFAULT '[]'
+);
+"""
+
+PATTERN_INDEX_DDL: List[str] = [
+    "CREATE INDEX IF NOT EXISTS idx_ip_hash    ON incident_patterns(fingerprint_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_family  ON incident_patterns(family_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_inc   ON incident_patterns(incident_id)",
+    "CREATE INDEX IF NOT EXISTS idx_if_hash    ON incident_families(family_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_inc     ON remediation_history(incident_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_pattern ON remediation_history(pattern_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_target  ON remediation_history(target_node_id)",
 ]

@@ -21,7 +21,7 @@ from .database import DatabaseManager
 
 
 def _json_default(obj: Any) -> Any:
-    """Custom JSON encoder: converts datetime → ISO-8601 string."""
+    """Custom JSON encoder: converts datetime to ISO-8601 string."""
     if isinstance(obj, datetime):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")

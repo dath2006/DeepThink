@@ -72,7 +72,7 @@ class TopologyHandler:
         """
         Process a rename event (inside an open DB transaction).
 
-        ``raw["from"]`` → ``raw["to"]``
+        ``raw["from"]`` becomes ``raw["to"]``
 
         Returns one ``("rename_node", ...)`` op for the coordinator to
         apply to NetworkX after commit.
@@ -85,7 +85,7 @@ class TopologyHandler:
             return []
 
         node_id = self._nodes.handle_rename(from_name, to_name, ts)
-        log.debug("DB rename %s: '%s' → '%s'", node_id, from_name, to_name)
+        log.debug("DB rename %s: '%s' to '%s'", node_id, from_name, to_name)
 
         return [("rename_node", node_id, to_name, from_name)]
 
@@ -134,7 +134,7 @@ class TopologyHandler:
 
         if op in ("remove", "delete", "retire"):
             self._edges.retire(src_id, dst_id, EdgeKind.DEPENDENCY.value, ts)
-            log.debug("DB retired dependency %s → %s", src_name, dst_name)
+            log.debug("DB retired dependency %s to %s", src_name, dst_name)
             return [
                 ("node",        src_id, src_name, []),
                 ("node",        dst_id, dst_name, []),
@@ -149,7 +149,7 @@ class TopologyHandler:
                 evidence_event_ids=[event_id],
                 confidence=1.0,
             )
-            log.debug("DB upserted dependency %s → %s", src_name, dst_name)
+            log.debug("DB upserted dependency %s to %s", src_name, dst_name)
             return [
                 ("node", src_id, src_name, []),
                 ("node", dst_id, dst_name, []),
