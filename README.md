@@ -5,8 +5,8 @@ A persistent, graph-aware context engine for AI SRE. Ingests telemetry streams, 
 ## Quickstart
 
 ```bash
-git clone https://github.com/Sauhard74/Anvil-P-E.git
-cd Anvil-P-E
+git clone https://github.com/dath2006/DeepThink.git
+cd DeepThink
 pip install -r persistent_context_engine/requirements.txt
 ./bench/run.sh --quick
 ```
@@ -104,12 +104,12 @@ No external services. No network access. Fully in-process.
 
 ## Benchmark Scores (canonical 5-seed run)
 
-| Metric | Value |
-|---|---|
-| `recall@5` | 0.800 |
-| `precision@5_mean` | 0.272 |
-| `remediation_acc` | 1.000 |
-| `latency_p95_ms` | ≤ 141 ms |
+| Metric                 | Value            |
+| ---------------------- | ---------------- |
+| `recall@5`             | 0.800            |
+| `precision@5_mean`     | 0.272            |
+| `remediation_acc`      | 1.000            |
+| `latency_p95_ms`       | ≤ 141 ms         |
 | **Weighted automated** | **0.631 / 0.80** |
 
 Max automated score is 0.80 — the remaining 0.20 is panel-graded (`manual_context`, `manual_explain`).
