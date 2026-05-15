@@ -191,6 +191,16 @@ class Fingerprinter:
                 kind_label = f"log:{level}"
             elif kind == EventKind.DEPLOY:
                 kind_label = "deploy"
+            elif kind == EventKind.INCIDENT_SIGNAL:
+                # Extract alert metric from trigger string so families that fire
+                # on different metrics produce different hashes.
+                # trigger format: "alert:<svc>/<metric>><threshold>"
+                trigger_str = ev.get("trigger", "")
+                alert_metric = ""
+                if "/" in trigger_str:
+                    metric_part = trigger_str.split("/", 1)[-1]
+                    alert_metric = metric_part.split(">")[0].split("<")[0].strip()
+                kind_label = f"incident_signal:{alert_metric}" if alert_metric else "incident_signal"
             elif kind == EventKind.REMEDIATION:
                 action = ev.get("action", "unknown")
                 kind_label = f"remediation:{action}"
