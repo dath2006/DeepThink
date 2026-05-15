@@ -39,3 +39,11 @@ class EngineConfig:
 
     deep_mode_max_events: int = 1000
     """Maximum related events returned in deep reconstruction mode."""
+
+    # -----------------------------------------------------------------------
+    # Caching (Phase 3)
+    # -----------------------------------------------------------------------
+    fingerprint_cache_ttl_seconds: float = 30.0
+    """TTL for in-memory fingerprint→similar-incidents cache.  Avoids
+    redundant DB scans when multiple signals share the same fingerprint
+    within a short window."""
