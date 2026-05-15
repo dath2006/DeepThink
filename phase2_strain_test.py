@@ -21,9 +21,8 @@ import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Tuple
-
-sys.path.insert(0, "d:/Agents/DeepThink")
-
+import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 from persistent_context_engine import Engine, EngineConfig
 from persistent_context_engine.incident_fingerprinter import (
     Fingerprinter, IncidentFingerprint, compute_similarity
@@ -274,7 +273,8 @@ def test_soft_matching_robustness():
         print(f"\n[3.{test_cases.index((test_name, expected_dist, modifications))+2}] {test_name}")
         
         # Create modified pattern
-        modified_events = modify_events(ref_events, modifications, base_ts + timedelta(hours=10))
+        idx = test_cases.index((test_name, expected_dist, modifications))
+        modified_events = modify_events(ref_events, modifications, base_ts + timedelta(hours=10 + idx))
         inc_id = f"MOD-{expected_dist}"
         
         # Replace incident_signal id
@@ -610,7 +610,7 @@ def create_incident_pattern(engine, base_ts, service, incident_id, pattern_type)
         events = [
             {"ts": base_ts, "kind": "deploy", "service": service, "version": "v1.0.0", "actor": "ci"},
             {"ts": base_ts + timedelta(minutes=2), "kind": "metric", "service": service,
-             "name": "latency_p99_ms", "value": 5000 + random.randint(-500, 500)},
+             "name": "latency_p99_ms", "value": 5500},
             {"ts": base_ts + timedelta(minutes=5), "kind": "incident_signal",
              "incident_id": incident_id, "trigger": f"alert:{service}/latency>4s", "service": service},
             {"ts": base_ts + timedelta(minutes=15), "kind": "remediation",

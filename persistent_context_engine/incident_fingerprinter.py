@@ -16,9 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from .schema import EventKind
 
 
-# Fingerprint element: (event_kind, role, direction, relative_minutes)
+# Fingerprint element: (event_kind, role, direction)
 # Role is topology-based, NOT service name-based
-FingerprintElement = Tuple[str, str, str, int]
+FingerprintElement = Tuple[str, str, str]
 
 
 @dataclass
@@ -37,8 +37,8 @@ class IncidentFingerprint:
 
     def edit_distance(self, other: 'IncidentFingerprint') -> int:
         """Compute Levenshtein distance between two fingerprint sequences."""
-        seq1 = self.elements
-        seq2 = other.elements
+        seq1 = [tuple(x) if isinstance(x, list) else x for x in self.elements]
+        seq2 = [tuple(x) if isinstance(x, list) else x for x in other.elements]
 
         if not seq1:
             return len(seq2)
@@ -126,7 +126,7 @@ class Fingerprinter:
             )
 
         # Build fingerprint elements
-        elements: List[FingerprintElement] = []
+        elements_with_time: List[Tuple[int, str, str, str]] = []
 
         # Signal-dense event kinds for incident patterns
         SIGNAL_KINDS = {EventKind.DEPLOY, EventKind.LOG, EventKind.INCIDENT_SIGNAL, 
@@ -164,7 +164,9 @@ class Fingerprinter:
             if not node_id:
                 continue
 
-            role = role_map.get(node_id, "unknown")
+            role = role_map.get(node_id)
+            if not role or role == "unknown":
+                continue
 
             # Direction relative to incident
             direction = "before" if ev_ts <= incident_ts else "after"
@@ -179,7 +181,9 @@ class Fingerprinter:
                 bucketed = self._bucket_metric(name, value)
                 kind_label = f"metric:{name}:{bucketed}"
             elif kind == EventKind.LOG:
-                level = ev.get("level", "info")
+                level = ev.get("level", "info").lower()
+                if level not in ("error", "critical", "warn", "warning", "fatal", "exception"):
+                    continue
                 kind_label = f"log:{level}"
             elif kind == EventKind.DEPLOY:
                 kind_label = "deploy"
@@ -191,11 +195,20 @@ class Fingerprinter:
             else:
                 kind_label = kind
 
-            element = (kind_label, role, direction, rel_minutes)
-            elements.append(element)
+            element = (rel_minutes, kind_label, role, direction)
+            elements_with_time.append(element)
 
         # Sort by relative time for canonical ordering
-        elements.sort(key=lambda e: (e[3], e[0], e[1]))
+        elements_with_time.sort(key=lambda e: (e[0], e[1], e[2]))
+
+        # Strip relative time to make fingerprint robust to exact timing shifts
+        raw_elements: List[FingerprintElement] = [(e[1], e[2], e[3]) for e in elements_with_time]
+        
+        # Deduplicate consecutive identical elements (collapse spam)
+        elements: List[FingerprintElement] = []
+        for el in raw_elements:
+            if not elements or elements[-1] != el:
+                elements.append(el)
 
         # Compute structural hash
         hash_input = json.dumps(elements, separators=(',', ':'))

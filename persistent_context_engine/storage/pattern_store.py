@@ -160,15 +160,17 @@ class PatternStore:
                     event_count=len(rep_elements)
                 )
                 distance = new_fp.edit_distance(rep_fp)
-                if distance <= soft_match_threshold and distance < best_distance:
-                    best_distance = distance
-                    best_match = (family_id, confidence, distance)
+                if distance <= soft_match_threshold:
+                    max_len = max(len(new_elements), len(rep_elements))
+                    sim = 1.0 - (distance / max_len) if max_len > 0 else 1.0
+                    if sim >= 0.6 and distance < best_distance:
+                        best_distance = distance
+                        best_match = (family_id, confidence, distance, sim)
             except Exception:
                 continue
         
         if best_match:
-            family_id, confidence, distance = best_match
-            similarity = 1.0 - (distance / (len(new_elements) + 0.001))  # Normalize
+            family_id, confidence, distance, similarity = best_match
             now = datetime.now(timezone.utc)
             
             # Update family
