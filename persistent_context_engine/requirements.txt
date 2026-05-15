@@ -1,0 +1,8 @@
+# Persistent Context Engine — Phase 1 dependencies
+# Pin to minor versions; patch updates are safe.
+
+# Analytical in-process database (source of truth for all persistent state)
+duckdb>=0.10.0,<2.0.0
+
+# In-memory graph for fast traversal (UUID-keyed DiGraph)
+networkx>=3.0,<4.0
