@@ -251,6 +251,7 @@ CREATE TABLE IF NOT EXISTS incident_patterns (
 CREATE TABLE IF NOT EXISTS incident_families (
     id                      VARCHAR PRIMARY KEY,
     family_hash             VARCHAR NOT NULL,
+    trigger_node_id         VARCHAR NOT NULL DEFAULT '',
     representative_pattern_id VARCHAR NOT NULL,
     incident_count          INTEGER NOT NULL DEFAULT 0,
     first_seen_ts           TIMESTAMPTZ NOT NULL,
@@ -277,7 +278,7 @@ PATTERN_INDEX_DDL: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_ip_hash    ON incident_patterns(fingerprint_hash)",
     "CREATE INDEX IF NOT EXISTS idx_ip_family  ON incident_patterns(family_id)",
     "CREATE INDEX IF NOT EXISTS idx_ip_inc   ON incident_patterns(incident_id)",
-    "CREATE INDEX IF NOT EXISTS idx_if_hash    ON incident_families(family_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_if_hash    ON incident_families(family_hash, trigger_node_id)",
     "CREATE INDEX IF NOT EXISTS idx_rh_inc     ON remediation_history(incident_id)",
     "CREATE INDEX IF NOT EXISTS idx_rh_pattern ON remediation_history(pattern_id)",
     "CREATE INDEX IF NOT EXISTS idx_rh_target  ON remediation_history(target_node_id)",

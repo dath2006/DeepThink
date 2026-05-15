@@ -79,12 +79,19 @@ class PatternStore:
         fingerprint_tuple: str,
         pattern_id: str,
         created_at: datetime,
+        trigger_node_id: str = "",
         soft_match_threshold: int = 1,  # Edit distance threshold for soft matching
     ) -> Tuple[str, float]:
         """
         Find an existing family matching this hash, or create a new one.
-        
-        Tries exact hash match first, then soft matching (edit distance <= threshold).
+
+        Family identity is scoped to (fingerprint_hash, trigger_node_id) so that
+        identical fingerprints on different trigger services produce distinct
+        family UUIDs.  This prevents the all-families-collapse-to-one problem
+        when many families share the same event template.
+
+        Tries exact (hash, trigger) match first, then soft matching (edit
+        distance <= threshold) within the same trigger service.
 
         Returns (family_id, base_confidence).
         """
@@ -93,14 +100,14 @@ class PatternStore:
         
         cursor = self._cursor()
         
-        # 1. Check for exact hash match
+        # 1. Check for exact (hash, trigger) match
         row = cursor.execute(
             """
             SELECT id, reinforced_confidence FROM incident_families
-            WHERE family_hash = ?
+            WHERE family_hash = ? AND trigger_node_id = ?
             LIMIT 1
             """,
-            [fingerprint_hash]
+            [fingerprint_hash, trigger_node_id]
         ).fetchone()
 
         if row:
@@ -125,7 +132,7 @@ class PatternStore:
             )
             return family_id, confidence
 
-        # 2. Try soft matching against existing families
+        # 2. Try soft matching against existing families with the same trigger
         new_elements = json.loads(fingerprint_tuple)
         new_fp = IncidentFingerprint(
             elements=new_elements,
@@ -135,14 +142,16 @@ class PatternStore:
             window_end=created_at,
             event_count=len(new_elements)
         )
-        
-        # Get all families with their representative patterns
+
+        # Only soft-match within same trigger service to avoid cross-service merging
         families = cursor.execute(
             """
             SELECT f.id, f.family_hash, f.reinforced_confidence, p.fingerprint_tuple
             FROM incident_families f
             JOIN incident_patterns p ON f.representative_pattern_id = p.id
-            """
+            WHERE f.trigger_node_id = ?
+            """,
+            [trigger_node_id]
         ).fetchall()
         
         best_match = None
@@ -201,12 +210,13 @@ class PatternStore:
         self._db.conn.execute(
             """
             INSERT INTO incident_families (
-                id, family_hash, representative_pattern_id, incident_count,
-                first_seen_ts, last_confirmed_ts, reinforced_confidence, decay_rate
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                id, family_hash, trigger_node_id, representative_pattern_id,
+                incident_count, first_seen_ts, last_confirmed_ts,
+                reinforced_confidence, decay_rate
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
-                family_id, fingerprint_hash, pattern_id, 1,
+                family_id, fingerprint_hash, trigger_node_id, pattern_id, 1,
                 now, now, 0.5, 0.95
             ],
         )

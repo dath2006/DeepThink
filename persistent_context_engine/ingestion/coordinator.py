@@ -484,12 +484,13 @@ class IngestCoordinator:
             event_count=fingerprint.event_count,
         )
 
-        # Find or create family (with soft matching)
+        # Find or create family (scoped to trigger service + fingerprint hash)
         family_id, base_conf = self._patterns.find_or_create_family(
             fingerprint_hash=fingerprint.structural_hash,
             fingerprint_tuple=fingerprint.to_tuple_string(),
             pattern_id=pattern_id,
             created_at=ts,
+            trigger_node_id=trigger_node_id,
         )
 
         log.debug(

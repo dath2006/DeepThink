@@ -832,12 +832,9 @@ class Engine:
 
         matches: List[IncidentMatch] = []
         used_ids: set = set()
+        used_triggers: set = set()
+        used_families: set = set()
         used_composite: set = set()
-
-        def _trig_name(c: Dict[str, Any]) -> str:
-            trig_id = c.get("trigger_node_id") or ""
-            return (self._node_store.get_canonical_name(trig_id)
-                    if trig_id else "unknown") or trig_id or "unknown"
 
         def _add_match(c: Dict[str, Any]) -> bool:
             if c["incident_id"] in used_ids or len(matches) >= mp.match_limit:
@@ -848,53 +845,44 @@ class Engine:
                 similarity=round(c["similarity"], 3),
                 rationale=c["rationale"],
             ))
-            used_composite.add((_trig_name(c), c["family_id"]))
+            trig_id = c.get("trigger_node_id") or ""
+            trig_name = (self._node_store.get_canonical_name(trig_id)
+                         if trig_id else "unknown") or trig_id or "unknown"
+            used_triggers.add(trig_name)
+            used_families.add(c["family_id"])
+            used_composite.add((trig_name, c["family_id"]))
             return True
 
-        # Candidates are sorted (similarity DESC, same_service DESC).
-        # When all fingerprints hash identically (same template across families),
-        # same-service candidates must fill slots before cross-service diversity
-        # displaces them.  Strategy:
-        #
-        # Pass 1: fill up to floor(match_limit/2) slots with same-service
-        #         candidates (highest-similarity first, no diversity constraint).
-        #         This guarantees the correct family appears in top-k even when
-        #         all hashes are identical.
-        #
-        # Pass 2: fill remaining slots with one-per-composite-key diversity
-        #         across ALL candidates (including cross-service).  This preserves
-        #         recall for families whose trigger service has no same-service
-        #         training history (e.g. service seen for first time at eval).
-        #
-        # Pass 3: fill any final slots with highest-similarity not yet included.
-
-        same_svc_budget = mp.match_limit // 2  # e.g. 5//2 = 2 guaranteed slots
-
-        # Pass 1: same-service priority slots
+        # Pass 1: one best match per distinct composite key (trigger × family).
         for c in candidates:
-            if not c["same_service"]:
+            trig_id = c.get("trigger_node_id") or ""
+            trig_name = (self._node_store.get_canonical_name(trig_id)
+                         if trig_id else "unknown") or trig_id or "unknown"
+            key = (trig_name, c["family_id"])
+            if key in used_composite:
                 continue
-            if len(matches) >= same_svc_budget:
-                break
             _add_match(c)
+            if len(matches) >= mp.match_limit:
+                break
 
-        # Pass 2: diversity across all candidates for remaining slots
+        # Pass 2: one per remaining trigger service
         if len(matches) < mp.match_limit:
             for c in candidates:
-                if c["incident_id"] in used_ids:
-                    continue
-                key = (_trig_name(c), c["family_id"])
-                if key in used_composite:
+                trig_id = c.get("trigger_node_id") or ""
+                trig_name = (self._node_store.get_canonical_name(trig_id)
+                             if trig_id else "unknown") or trig_id or "unknown"
+                if trig_name in used_triggers:
                     continue
                 _add_match(c)
                 if len(matches) >= mp.match_limit:
                     break
 
-        # Pass 3: fill remaining with best not yet included (relaxed)
+        # Pass 3: fill remaining slots with highest-similarity not yet included
         if len(matches) < mp.match_limit:
             for c in candidates:
-                if c["incident_id"] not in used_ids:
-                    _add_match(c)
+                if c["incident_id"] in used_ids:
+                    continue
+                _add_match(c)
                 if len(matches) >= mp.match_limit:
                     break
 
