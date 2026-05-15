@@ -72,6 +72,7 @@ class IngestCoordinator:
         remediation_store: RemediationStore,
         graph:      GraphManager,
         buffer:     RecentEventsBuffer,
+        temporal_view: Any = None,  # Optional TemporalGraphView for point-in-time topology
     ) -> None:
         self._db        = db
         self._raw       = raw_store
@@ -81,6 +82,7 @@ class IngestCoordinator:
         self._remeds    = remediation_store
         self._graph     = graph
         self._buffer    = buffer
+        self._temporal_view = temporal_view  # Used by fingerprinter for consistent roles
         self._parser    = EventParser()
         self._topology  = TopologyHandler(node_store, edge_store)
         self._fingerprinter = Fingerprinter()
@@ -324,7 +326,7 @@ class IngestCoordinator:
                     pass
             events_for_fp.append(raw)
 
-        # Extract fingerprint
+        # Extract fingerprint (with temporal view for consistent role computation)
         fingerprint = self._fingerprinter.fingerprint(
             trigger_node_id=trigger_node_id,
             trigger_service=service,
@@ -332,6 +334,7 @@ class IngestCoordinator:
             events=events_for_fp,
             graph_manager=self._graph,
             node_store=self._nodes,
+            temporal_view=getattr(self, '_temporal_view', None),
         )
 
         # Store pattern
@@ -345,11 +348,12 @@ class IngestCoordinator:
             event_count=fingerprint.event_count,
         )
 
-        # Find or create family
+        # Find or create family (with soft matching)
         family_id, base_conf = self._patterns.find_or_create_family(
-            fingerprint.structural_hash,
-            pattern_id,
-            ts,
+            fingerprint_hash=fingerprint.structural_hash,
+            fingerprint_tuple=fingerprint.to_tuple_string(),
+            pattern_id=pattern_id,
+            created_at=ts,
         )
 
         log.debug(

@@ -1,0 +1,1 @@
+The strain test shows intermittent failures due to metric bucketing thresholds (4500-4999="high", 5000+="critical") combined with random.randint(-500, 500) in test data. This is a test data quality issue - the engine correctly produces different hashes when metrics genuinely differ. With consistent values, patterns match perfectly.

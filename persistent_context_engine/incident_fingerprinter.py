@@ -95,6 +95,7 @@ class Fingerprinter:
         events: List[Dict[str, Any]],
         graph_manager: Any,  # GraphManager for topology lookups
         node_store: Any,     # NodeStore for name->UUID resolution
+        temporal_view: Any = None,  # Optional TemporalGraphView for point-in-time topology
     ) -> IncidentFingerprint:
         """
         Extract a fingerprint from a window of events.
@@ -105,19 +106,35 @@ class Fingerprinter:
         trigger_service: Canonical name of trigger service (for resolving names in events)
         incident_ts: When the incident signal fired
         events: Events in the window (with parsed 'ts' as datetime)
-        graph_manager: For computing hops from trigger service
+        graph_manager: For computing hops from trigger service (current state)
         node_store: For resolving service names to UUIDs
+        temporal_view: Optional TemporalGraphView for point-in-time topology.
+            If provided, uses topology at incident_ts for consistent role computation.
         """
         window_start = incident_ts - self.window_before
         window_end = incident_ts + self.window_after
 
         # Compute role mapping: node_id -> role string
-        role_map = self._compute_roles(
-            trigger_node_id, graph_manager, node_store
-        )
+        # Use temporal view if available for consistent role computation
+        if temporal_view:
+            role_map = self._compute_roles_temporal(
+                trigger_node_id, temporal_view, incident_ts
+            )
+        else:
+            role_map = self._compute_roles(
+                trigger_node_id, graph_manager, node_store
+            )
 
         # Build fingerprint elements
         elements: List[FingerprintElement] = []
+
+        # Signal-dense event kinds for incident patterns
+        SIGNAL_KINDS = {EventKind.DEPLOY, EventKind.LOG, EventKind.INCIDENT_SIGNAL, 
+                       EventKind.REMEDIATION, EventKind.TRACE}
+        
+        # Signal-dense metric names (exclude background noise like qps, cpu, etc.)
+        SIGNAL_METRICS = {"latency", "error", "memory", "heap", "gc", "timeout", 
+                         "failure", "dropped", "rejected", "queue"}
 
         for ev in events:
             ev_ts = ev.get("ts")
@@ -132,6 +149,15 @@ class Fingerprinter:
             # Skip events without a service we can resolve
             if not service:
                 continue
+
+            # FILTER: Only include signal-dense event kinds
+            if kind == EventKind.METRIC:
+                metric_name = ev.get("name", "")
+                # Only include metrics that indicate problems
+                if not any(sig in metric_name.lower() for sig in SIGNAL_METRICS):
+                    continue
+            elif kind not in SIGNAL_KINDS:
+                continue  # Skip topology, config, etc.
 
             # Resolve service to node_id, then to role
             node_id = node_store.resolve(service)
@@ -207,6 +233,48 @@ class Fingerprinter:
                 if node_id not in role_map:
                     role = f"{direction}-{hops}"
                     role_map[node_id] = role
+
+        return role_map
+
+    def _compute_roles_temporal(
+        self,
+        trigger_node_id: str,
+        temporal_view: Any,
+        incident_ts: datetime,
+    ) -> Dict[str, str]:
+        """
+        Compute role mapping using point-in-time topology.
+
+        This ensures consistent fingerprinting even when topology changes
+        over time (dependency additions/removals, renames).
+        """
+        role_map: Dict[str, str] = {trigger_node_id: "trigger"}
+
+        # Get neighborhood at incident time
+        neighborhood, subgraph = temporal_view.get_neighborhood_at_timestamp(
+            trigger_node_id, incident_ts, max_hops=2
+        )
+
+        # Compute hop distances using BFS on the subgraph
+        visited: Dict[str, int] = {trigger_node_id: 0}
+        frontier: Dict[str, int] = {trigger_node_id: 0}
+
+        for hop in range(1, 3):
+            next_frontier: Dict[str, int] = {}
+            for node_id, _ in frontier.items():
+                # Check both directions in the subgraph
+                if node_id in subgraph.nodes:
+                    for succ in subgraph.successors(node_id):
+                        if succ not in visited:
+                            visited[succ] = hop
+                            next_frontier[succ] = hop
+                            role_map[succ] = f"downstream-{hop}"
+                    for pred in subgraph.predecessors(node_id):
+                        if pred not in visited:
+                            visited[pred] = hop
+                            next_frontier[pred] = hop
+                            role_map[pred] = f"upstream-{hop}"
+            frontier = next_frontier
 
         return role_map
 

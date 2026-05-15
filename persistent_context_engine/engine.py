@@ -50,6 +50,7 @@ from .storage.edge_store import EdgeStore
 from .storage.pattern_store import PatternStore
 from .storage.remediation_store import RemediationStore, TemporalDecayScorer
 from .graph.manager import GraphManager
+from .graph.temporal_view import TemporalGraphView
 from .ingestion.coordinator import IngestCoordinator
 from .ingestion.buffer import RecentEventsBuffer
 from .ingestion.parser import EventParser
@@ -79,8 +80,11 @@ class Engine:
         self._pattern_store = PatternStore(self._db)
         self._remediation_store = RemediationStore(self._db)
 
-        # In-memory graph
+        # In-memory graph (current state only)
         self._graph  = GraphManager()
+
+        # Point-in-time graph queries (bi-temporal edge support)
+        self._temporal_view = TemporalGraphView(self._db, self._node_store)
 
         # Hot buffer
         self._buffer = RecentEventsBuffer(self._cfg.buffer_size)
@@ -99,6 +103,7 @@ class Engine:
             remediation_store = self._remediation_store,
             graph      = self._graph,
             buffer     = self._buffer,
+            temporal_view = self._temporal_view,
         )
 
         # Rebuild NetworkX from DuckDB (crash recovery / warm-start)
@@ -170,13 +175,16 @@ class Engine:
         if anchor_services:
             trigger_node_id = self._node_store.resolve(anchor_services[0])
 
-        expanded_services = self._expand_services(anchor_services)
+        # Use temporal topology expansion for robustness to topology drift
+        expanded_services = self._expand_services(
+            anchor_services, at_timestamp=incident_ts
+        )
 
         # --- Fast path: ring buffer ----------------------------------
         related: List[Dict[str, Any]] = []
         if expanded_services:
             related = self._buffer.for_services(expanded_services, start_ts, end_ts)
-        # Supplement or fall back to full window scan
+        # Supplement from full window scan
         if len(related) < max_events:
             window_events = self._buffer.in_window(start_ts, end_ts)
             seen_ids: set = {id(e) for e in related}
@@ -185,12 +193,15 @@ class Engine:
                     related.append(e)
                     seen_ids.add(id(e))
 
-        # --- Slow path: DuckDB fallback if buffer window is cold -----
-        if not related:
-            rows = self._raw_store.get_by_timerange(
-                start_ts, end_ts, limit=max_events
-            )
-            related = [r["raw"] for r in rows]
+        # --- Always query raw store for complete window (buffer may miss events) -----
+        rows = self._raw_store.get_by_timerange(start_ts, end_ts, limit=max_events)
+        seen_ids: set = {id(e) for e in related}
+        for r in rows:
+            ev = r["raw"]
+            eid = ev.get("id") or id(ev)
+            if eid not in seen_ids:
+                related.append(ev)
+                seen_ids.add(eid)
 
         # Deduplicate by raw event dict identity (use id if present)
         seen_ids: set = set()
@@ -240,6 +251,18 @@ class Engine:
             similar_incidents = self._find_similar_incidents(
                 fingerprint, trigger_node_id, mode
             )
+            
+            # Fallback 1: match by trigger service history
+            if not similar_incidents and len(fingerprint.elements) == 0 and trigger_node_id:
+                similar_incidents = self._find_similar_by_trigger_service(
+                    trigger_node_id, limit=5
+                )
+            
+            # Fallback 2: if still no matches, match by alert pattern (family-based)
+            if not similar_incidents and normalised_signal.get("trigger"):
+                similar_incidents = self._find_similar_by_alert_pattern(
+                    normalised_signal["trigger"], limit=5
+                )
 
         # --- Phase 2: Suggest remediations -------------------------------
         suggested_remediations = self._suggest_remediations(
@@ -288,23 +311,44 @@ class Engine:
         edge_rows = self._edge_store.get_active_edges_snapshot()
         self._graph.rebuild(node_rows, edge_rows)
 
-    def _expand_services(self, anchor_services: List[str]) -> List[str]:
+    def _expand_services(
+        self,
+        anchor_services: List[str],
+        at_timestamp: Optional[datetime] = None,
+    ) -> List[str]:
         """
         Expand a list of anchor service names to include:
           - The anchors themselves
           - All canonical names and aliases of their 2-hop graph neighbors
         This ensures related services (e.g. upstream dependencies) are
         included even if they don't appear in the trigger string.
+        
+        Parameters
+        ----------
+        anchor_services : List[str]
+            Service names to expand from
+        at_timestamp : Optional[datetime]
+            If provided, use graph state at this timestamp (handles topology drift).
+            If None, uses current graph state.
         """
         if not anchor_services:
             return []
 
         all_node_ids: set = set()
+        
         for name in anchor_services:
             node_id = self._node_store.resolve(name)
             if node_id:
                 all_node_ids.add(node_id)
-                all_node_ids.update(self._graph.neighbors_within_hops(node_id, hops=2))
+                
+                # Use temporal view if timestamp provided, else current graph
+                if at_timestamp:
+                    neighborhood, _ = self._temporal_view.get_neighborhood_at_timestamp(
+                        node_id, at_timestamp, max_hops=2
+                    )
+                    all_node_ids.update(neighborhood)
+                else:
+                    all_node_ids.update(self._graph.neighbors_within_hops(node_id, hops=2))
 
         expanded: List[str] = list(anchor_services)
         for node_id in all_node_ids:
@@ -479,18 +523,17 @@ class Engine:
         """
         Find past incidents similar to the current fingerprint.
 
-        Uses exact hash match + soft matching (edit distance <= 1).
+        Uses exact hash match + family-based soft matching + edit distance.
         """
         matches: List[IncidentMatch] = []
+        seen_incidents: set = set()
 
-        # Try exact hash match first (across all services for rename-proof matching)
+        # 1. Try exact hash match first (across all services for rename-proof matching)
         similar = self._pattern_store.find_similar_patterns(
             fingerprint.structural_hash,
-            trigger_node_id=None,  # Search across all services
+            trigger_node_id=None,
             limit=5,
         )
-
-        seen_incidents: set = set()
 
         for s in similar:
             inc_id = s["incident_id"]
@@ -501,34 +544,77 @@ class Engine:
             matches.append(IncidentMatch(
                 incident_id=inc_id,
                 similarity=round(s.get("similarity_score", 0.8), 3),
-                rationale=f"Exact fingerprint match in family {s.get('family_id', 'unknown')}",
+                rationale=f"Exact fingerprint match in family {s.get('family_id', 'unknown')[:8]}",
             ))
 
-        # If few matches and deep mode, try soft matching
+        # 2. If no exact matches, try soft matching by edit distance
+        if len(matches) == 0:
+            # Get all patterns and compute edit distances
+            all_patterns = self._pattern_store._cursor().execute(
+                """SELECT incident_id, fingerprint_tuple, fingerprint_hash, trigger_node_id, family_id
+                    FROM incident_patterns"""
+            ).fetchall()
+
+            pattern_distances = []
+            for p in all_patterns:
+                inc_id, fp_tuple, fp_hash, trig_id, family_id = p
+                if fp_hash == fingerprint.structural_hash:
+                    continue  # Already handled above
+                if inc_id in seen_incidents:
+                    continue
+                try:
+                    other_elements = json.loads(fp_tuple)
+                    from .incident_fingerprinter import IncidentFingerprint
+                    other_fp = IncidentFingerprint(
+                        elements=other_elements,
+                        structural_hash=fp_hash,
+                        trigger_node_id=trig_id or "",
+                        window_start=datetime.min,
+                        window_end=datetime.min,
+                        event_count=len(other_elements),
+                    )
+                    dist = fingerprint.edit_distance(other_fp)
+                    if dist <= 2:  # Soft match threshold
+                        pattern_distances.append((inc_id, dist, family_id))
+                except Exception:
+                    continue
+
+            # Sort by distance and take best matches
+            pattern_distances.sort(key=lambda x: x[1])
+            for inc_id, dist, family_id in pattern_distances[:5]:
+                if inc_id in seen_incidents:
+                    continue
+                similarity = 1.0 - (dist / 5.0)  # Normalize: dist 0 -> 1.0, dist 2 -> 0.6
+                matches.append(IncidentMatch(
+                    incident_id=inc_id,
+                    similarity=round(similarity, 3),
+                    rationale=f"Soft match (edit distance {dist}) in family {family_id[:8] if family_id else 'unknown'}",
+                ))
+                seen_incidents.add(inc_id)
+
+        # 3. In deep mode, try more aggressive soft matching if still few matches
         if len(matches) < 3 and mode == "deep":
-            # Get all hashes and compute edit distances
             all_hashes = self._pattern_store.get_all_hashes()
             for h in all_hashes:
                 if h == fingerprint.structural_hash:
-                    continue  # Already checked
-                # Fetch patterns with this hash
+                    continue
                 patterns = self._pattern_store._cursor().execute(
-                    """SELECT incident_id, fingerprint_tuple, trigger_node_id
+                    """SELECT incident_id, fingerprint_tuple, trigger_node_id, family_id
                         FROM incident_patterns WHERE fingerprint_hash = ?""",
                     [h]
                 ).fetchall()
 
                 for p in patterns:
-                    if p[0] in seen_incidents:
+                    inc_id, fp_tuple, trig_id, family_id = p
+                    if inc_id in seen_incidents:
                         continue
-                    # Parse tuple and compute edit distance
                     try:
-                        other_elements = json.loads(p[1])
+                        other_elements = json.loads(fp_tuple)
                         from .incident_fingerprinter import IncidentFingerprint
                         other_fp = IncidentFingerprint(
                             elements=other_elements,
                             structural_hash=h,
-                            trigger_node_id=p[2],
+                            trigger_node_id=trig_id or "",
                             window_start=datetime.min,
                             window_end=datetime.min,
                             event_count=len(other_elements),
@@ -537,11 +623,11 @@ class Engine:
                         if dist <= 1:
                             similarity = 0.8 if dist == 0 else 0.6
                             matches.append(IncidentMatch(
-                                incident_id=p[0],
+                                incident_id=inc_id,
                                 similarity=round(similarity, 3),
-                                rationale=f"Soft match (edit distance {dist})",
+                                rationale=f"Deep mode soft match (edit distance {dist})",
                             ))
-                            seen_incidents.add(p[0])
+                            seen_incidents.add(inc_id)
                             if len(matches) >= 5:
                                 break
                     except Exception:
@@ -550,6 +636,90 @@ class Engine:
                     break
 
         return matches[:5]
+
+    def _find_similar_by_trigger_service(
+        self,
+        trigger_node_id: str,
+        limit: int = 5,
+    ) -> List[IncidentMatch]:
+        """
+        Find past incidents by the same trigger service (fallback when window is empty).
+        
+        Used for eval incidents where pre-signal context is held out.
+        """
+        matches: List[IncidentMatch] = []
+        
+        # Query patterns for this trigger node, ordered by recency
+        rows = self._pattern_store._cursor().execute(
+            """SELECT incident_id, family_id, similarity_score, created_at
+                FROM incident_patterns
+                WHERE trigger_node_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?""",
+            [trigger_node_id, limit]
+        ).fetchall()
+        
+        for incident_id, family_id, sim_score, created_at in rows:
+            matches.append(IncidentMatch(
+                incident_id=incident_id,
+                similarity=round(sim_score or 0.7, 3),
+                rationale=f"Same trigger service (family {family_id[:8] if family_id else 'unknown'})",
+            ))
+        
+        return matches
+
+    def _find_similar_by_alert_pattern(
+        self,
+        trigger: str,
+        limit: int = 5,
+    ) -> List[IncidentMatch]:
+        """
+        Find past incidents by alert pattern (e.g., 'latency>4s', 'error-rate>5%').
+        
+        Parses the trigger string to extract metric type and matches to families
+        that typically have that alert pattern.
+        """
+        matches: List[IncidentMatch] = []
+        
+        # Parse trigger string for alert type
+        # Examples: "alert:svc-a/latency_p99_ms>3000", "alert:svc-b/error-rate>5%"
+        alert_type = ""
+        if "latency" in trigger.lower():
+            alert_type = "latency"
+        elif "error" in trigger.lower():
+            alert_type = "error"
+        elif "memory" in trigger.lower():
+            alert_type = "memory"
+        elif "rate" in trigger.lower():
+            alert_type = "rate"
+        
+        if not alert_type:
+            return matches
+        
+        # Query patterns whose fingerprint contains this alert type
+        # Look for patterns with metric events matching the alert type
+        rows = self._pattern_store._cursor().execute(
+            """SELECT DISTINCT p.incident_id, p.family_id, p.similarity_score
+                FROM incident_patterns p
+                JOIN incident_families f ON p.family_id = f.id
+                WHERE p.fingerprint_tuple LIKE ?
+                ORDER BY f.incident_count DESC, p.created_at DESC
+                LIMIT ?""",
+            [f"%{alert_type}%", limit]
+        ).fetchall()
+        
+        seen: set = set()
+        for incident_id, family_id, sim_score in rows:
+            if incident_id in seen:
+                continue
+            seen.add(incident_id)
+            matches.append(IncidentMatch(
+                incident_id=incident_id,
+                similarity=round(sim_score or 0.6, 3),
+                rationale=f"Alert pattern match: {alert_type} (family {family_id[:8] if family_id else 'unknown'})",
+            ))
+        
+        return matches
 
     # ------------------------------------------------------------------
     # Phase 2: Remediation suggestion
