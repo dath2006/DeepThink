@@ -96,6 +96,7 @@ class Fingerprinter:
         graph_manager: Any,  # GraphManager for topology lookups
         node_store: Any,     # NodeStore for name->UUID resolution
         temporal_view: Any = None,  # Optional TemporalGraphView for point-in-time topology
+        time_bucket_minutes: int = 5,  # Granularity: coarse=10 (fast), fine=2 (deep)
     ) -> IncidentFingerprint:
         """
         Extract a fingerprint from a window of events.
@@ -103,13 +104,13 @@ class Fingerprinter:
         Parameters
         ----------
         trigger_node_id: UUID of the triggering service
-        trigger_service: Canonical name of trigger service (for resolving names in events)
+        trigger_service: Canonical name of trigger service
         incident_ts: When the incident signal fired
         events: Events in the window (with parsed 'ts' as datetime)
-        graph_manager: For computing hops from trigger service (current state)
+        graph_manager: For computing hops from trigger service
         node_store: For resolving service names to UUIDs
-        temporal_view: Optional TemporalGraphView for point-in-time topology.
-            If provided, uses topology at incident_ts for consistent role computation.
+        temporal_view: Optional TemporalGraphView for point-in-time topology
+        time_bucket_minutes: Granularity for time bucketing (fast=10, deep=2)
         """
         window_start = incident_ts - self.window_before
         window_end = incident_ts + self.window_after
@@ -165,14 +166,17 @@ class Fingerprinter:
                 continue
 
             role = role_map.get(node_id)
-            if not role or role == "unknown":
-                continue
+            if not role:
+                # Assign fallback role for services not in graph topology.
+                # These still carry signal (e.g. upstream error logs).
+                role = "other"
 
             # Direction relative to incident
             direction = "before" if ev_ts <= incident_ts else "after"
 
-            # Relative time rounded to nearest minute
-            rel_minutes = int((ev_ts - incident_ts).total_seconds() / 60)
+            # Relative time bucketed by granularity
+            raw_minutes = (ev_ts - incident_ts).total_seconds() / 60
+            rel_minutes = int(raw_minutes / time_bucket_minutes) * time_bucket_minutes
 
             # Bucket metric values to avoid over-specificity
             if kind == EventKind.METRIC:

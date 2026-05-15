@@ -79,7 +79,7 @@ class PatternStore:
         fingerprint_tuple: str,
         pattern_id: str,
         created_at: datetime,
-        soft_match_threshold: int = 2,  # Edit distance threshold for soft matching
+        soft_match_threshold: int = 1,  # Edit distance threshold for soft matching
     ) -> Tuple[str, float]:
         """
         Find an existing family matching this hash, or create a new one.
@@ -163,7 +163,7 @@ class PatternStore:
                 if distance <= soft_match_threshold:
                     max_len = max(len(new_elements), len(rep_elements))
                     sim = 1.0 - (distance / max_len) if max_len > 0 else 1.0
-                    if sim >= 0.6 and distance < best_distance:
+                    if sim >= 0.8 and distance < best_distance:
                         best_distance = distance
                         best_match = (family_id, confidence, distance, sim)
             except Exception:

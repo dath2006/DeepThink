@@ -260,7 +260,7 @@ class IngestCoordinator:
         if incident_id:
             pattern = self._patterns.get_pattern_by_incident(incident_id)
 
-        # Store remediation
+        # Store remediation with event timestamp for correct temporal decay
         self._remeds.insert(
             incident_id=incident_id or "unknown",
             pattern_id=pattern["id"] if pattern else None,
@@ -269,6 +269,7 @@ class IngestCoordinator:
             target_service=target_service,
             outcome=outcome,
             evidence_event_ids=[event_id],
+            event_ts=ts,
         )
 
         # Reinforce family confidence if resolved

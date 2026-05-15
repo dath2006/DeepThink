@@ -12,7 +12,7 @@ Quick-start
 """
 
 from .engine import Engine
-from .config import EngineConfig
+from .config import EngineConfig, ModeParams
 from .schema import (
     Event,
     IncidentSignal,
@@ -27,6 +27,7 @@ from .schema import (
 __all__ = [
     "Engine",
     "EngineConfig",
+    "ModeParams",
     "Event",
     "IncidentSignal",
     "Context",

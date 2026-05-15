@@ -41,14 +41,17 @@ class RemediationStore:
         target_service: str,
         outcome: str,
         evidence_event_ids: List[str],
+        event_ts: Optional[datetime] = None,
     ) -> str:
         """
         Record a remediation action.
 
         Called when processing a 'remediation' event.
+        Uses event_ts (the telemetry timestamp) for applied_at so temporal
+        decay works correctly with synthetic/historical data.
         """
         rem_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        applied_at = event_ts or datetime.now(timezone.utc)
 
         # Compute initial confidence based on outcome
         base_confidence = 0.7 if outcome == "resolved" else 0.3 if outcome == "worsened" else 0.5
@@ -62,7 +65,7 @@ class RemediationStore:
             """,
             [
                 rem_id, incident_id, pattern_id, action, target_node_id,
-                target_service, outcome, base_confidence, now,
+                target_service, outcome, base_confidence, applied_at,
                 json.dumps(evidence_event_ids)
             ],
         )
