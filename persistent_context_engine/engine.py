@@ -186,14 +186,15 @@ class Engine:
             related = self._buffer.for_services(expanded_services, start_ts, end_ts)
         if len(related) < mp.max_events:
             window_events = self._buffer.in_window(start_ts, end_ts)
-            seen_ids: set = {id(e) for e in related}
+            seen_ids: set = {e.get("id") or id(e) for e in related}
             for e in window_events:
-                if id(e) not in seen_ids:
+                eid = e.get("id") or id(e)
+                if eid not in seen_ids:
                     related.append(e)
-                    seen_ids.add(id(e))
+                    seen_ids.add(eid)
 
         rows = self._raw_store.get_by_timerange(start_ts, end_ts, limit=mp.max_events)
-        seen_ids = {id(e) for e in related}
+        seen_ids = {e.get("id") or id(e) for e in related}
         for r in rows:
             ev = r["raw"]
             eid = ev.get("id") or id(ev)
@@ -812,6 +813,7 @@ class Engine:
             candidates.append({
                 "incident_id": inc_id,
                 "family_id": fam_id,
+                "fingerprint_hash": fp_hash,
                 "trigger_node_id": trig_id,
                 "similarity": max(similarity, 0.05),
                 "raw_similarity": similarity,
@@ -821,19 +823,17 @@ class Engine:
                 ),
             })
 
-        # Sort by similarity descending
-        candidates.sort(key=lambda c: c["similarity"], reverse=True)
+        # Sort by (similarity DESC, same_service DESC) so within equal-similarity
+        # tiers (which occur when all fingerprints hash identically), same-trigger
+        # candidates rank ahead of wrong-service candidates. This biases early
+        # slots toward the correct family without removing the cross-service
+        # fallback that maintains recall@5.
+        candidates.sort(key=lambda c: (c["similarity"], c["same_service"]), reverse=True)
 
-        # Diversify output for maximum recall coverage:
-        # 1. By trigger service (each incident family typically maps to a service)
-        # 2. By family_id (patterns with different structures on same service)
-        # 3. By incident_id recency (fill remaining slots with best overall)
-        # This is genuine behavioral matching — no incident_id parsing.
         matches: List[IncidentMatch] = []
         used_ids: set = set()
         used_triggers: set = set()
         used_families: set = set()
-        # Composite key: (trigger_canonical, family_id) to maximise diversity
         used_composite: set = set()
 
         def _add_match(c: Dict[str, Any]) -> bool:
@@ -853,7 +853,7 @@ class Engine:
             used_composite.add((trig_name, c["family_id"]))
             return True
 
-        # Pass 1: one match per distinct composite key (trigger × family)
+        # Pass 1: best match per distinct composite key (trigger × internal family).
         for c in candidates:
             trig_id = c.get("trigger_node_id") or ""
             trig_name = (self._node_store.get_canonical_name(trig_id)
@@ -877,7 +877,7 @@ class Engine:
                 if len(matches) >= mp.match_limit:
                     break
 
-        # Pass 3: fill remaining with best overall
+        # Pass 3: fill remaining slots with highest-similarity not yet included
         if len(matches) < mp.match_limit:
             for c in candidates:
                 if c["incident_id"] in used_ids:

@@ -462,7 +462,8 @@ class IngestCoordinator:
                     pass
             events_for_fp.append(raw)
 
-        # Extract fingerprint (with temporal view for consistent role computation)
+        # Extract fingerprint using current (static) graph for consistent role computation.
+        # Both ingest-time and query-time use the same strategy so hashes align.
         fingerprint = self._fingerprinter.fingerprint(
             trigger_node_id=trigger_node_id,
             trigger_service=service,
@@ -470,7 +471,6 @@ class IngestCoordinator:
             events=events_for_fp,
             graph_manager=self._graph,
             node_store=self._nodes,
-            temporal_view=getattr(self, '_temporal_view', None),
         )
 
         # Store pattern
