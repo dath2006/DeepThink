@@ -54,9 +54,30 @@ class IncidentFingerprint:
         for j in range(n + 1):
             dp[0][j] = j
 
+        def substitution_cost(a: FingerprintElement, b: FingerprintElement) -> int:
+            if a == b:
+                return 0
+
+            # Same metric type but different bucket is a low-cost substitution.
+            if a[0].startswith("metric:") and b[0].startswith("metric:"):
+                name_a = a[0].split(":", 2)[1]
+                name_b = b[0].split(":", 2)[1]
+                if name_a == name_b:
+                    return 1
+
+            # Same log level pattern differences are allowed at low cost.
+            if a[0].startswith("log:") and b[0].startswith("log:"):
+                level_a = a[0].split(":", 1)[1]
+                level_b = b[0].split(":", 1)[1]
+                if level_a == level_b:
+                    return 1
+
+            # Other substitutions are more expensive to avoid cross-family matching.
+            return 2
+
         for i in range(1, m + 1):
             for j in range(1, n + 1):
-                cost = 0 if seq1[i - 1] == seq2[j - 1] else 1
+                cost = substitution_cost(seq1[i - 1], seq2[j - 1])
                 dp[i][j] = min(
                     dp[i - 1][j] + 1,      # deletion
                     dp[i][j - 1] + 1,      # insertion
@@ -139,6 +160,9 @@ class Fingerprinter:
                 continue
 
             role = role_map.get(node_id, "unknown")
+            if role == "unknown":
+                # Ignore unrelated services outside the trigger topology
+                continue
 
             # Direction relative to incident
             direction = "before" if ev_ts <= incident_ts else "after"
@@ -218,10 +242,8 @@ class Fingerprinter:
                 return "low"
             elif value < 1000:
                 return "medium"
-            elif value < 5000:
-                return "high"
             else:
-                return "critical"
+                return "high"
 
         # Error rate bucketing
         if "error" in name.lower() or "rate" in name.lower():

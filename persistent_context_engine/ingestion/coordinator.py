@@ -315,7 +315,6 @@ class IngestCoordinator:
         events_for_fp = []
         for row in window_events:
             raw = row.get("raw", {})
-            # Parse ts back to datetime if needed
             raw_ts = raw.get("ts")
             if isinstance(raw_ts, str):
                 try:
@@ -323,6 +322,17 @@ class IngestCoordinator:
                 except Exception:
                     pass
             events_for_fp.append(raw)
+
+        # Include the current incident signal in the fingerprint window.
+        # DuckDB cursor reads inside the same transaction may not see the newly
+        # inserted incident signal row, so add it explicitly if missing.
+        if not any(
+            ev.get("kind") == event.get("kind") and
+            ev.get("incident_id") == event.get("incident_id") and
+            ev.get("ts") == event.get("ts")
+            for ev in events_for_fp
+        ):
+            events_for_fp.append(dict(event))
 
         # Extract fingerprint
         fingerprint = self._fingerprinter.fingerprint(
@@ -345,9 +355,9 @@ class IngestCoordinator:
             event_count=fingerprint.event_count,
         )
 
-        # Find or create family
+        # Find or create family using exact or soft fingerprint match
         family_id, base_conf = self._patterns.find_or_create_family(
-            fingerprint.structural_hash,
+            fingerprint,
             pattern_id,
             ts,
         )

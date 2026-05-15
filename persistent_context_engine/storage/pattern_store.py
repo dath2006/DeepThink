@@ -75,16 +75,22 @@ class PatternStore:
 
     def find_or_create_family(
         self,
-        fingerprint_hash: str,
+        fingerprint: Any,
         pattern_id: str,
         created_at: datetime,
     ) -> Tuple[str, float]:
         """
-        Find an existing family matching this hash, or create a new one.
+        Find an existing family matching this fingerprint, or create a new one.
+
+        This method supports:
+        - exact hash match for identical fingerprints
+        - soft matching by edit distance <= 1 for near-identical patterns
 
         Returns (family_id, base_confidence).
         """
-        # Check for exact hash match
+        from ..incident_fingerprinter import IncidentFingerprint
+
+        fingerprint_hash = fingerprint.structural_hash
         cursor = self._cursor()
         row = cursor.execute(
             """
@@ -97,7 +103,6 @@ class PatternStore:
 
         if row:
             family_id, confidence = row[0], row[1]
-            # Update family stats
             now = datetime.now(timezone.utc)
             self._db.conn.execute(
                 """
@@ -108,7 +113,6 @@ class PatternStore:
                 """,
                 [now, family_id]
             )
-            # Link pattern to family
             self._db.conn.execute(
                 """
                 UPDATE incident_patterns
@@ -119,7 +123,56 @@ class PatternStore:
             )
             return family_id, confidence
 
-        # Create new family
+        # Soft match against existing patterns if no exact family exists.
+        best_match: Optional[Tuple[str, int]] = None
+        all_rows = cursor.execute(
+            "SELECT id, fingerprint_tuple, family_id FROM incident_patterns WHERE family_id IS NOT NULL"
+        ).fetchall()
+        for row in all_rows:
+            existing_id, existing_tuple, existing_family_id = row
+            if existing_id == pattern_id or existing_family_id is None:
+                continue
+            try:
+                existing_elements = [tuple(item) for item in json.loads(existing_tuple)]
+                other_fp = IncidentFingerprint(
+                    elements=existing_elements,
+                    structural_hash="",
+                    trigger_node_id="",
+                    window_start=datetime.min.replace(tzinfo=timezone.utc),
+                    window_end=datetime.min.replace(tzinfo=timezone.utc),
+                    event_count=len(existing_elements),
+                )
+                dist = fingerprint.edit_distance(other_fp)
+                if dist <= 1 and (
+                    best_match is None or dist < best_match[1]
+                ):
+                    best_match = (existing_family_id, dist)
+            except Exception:
+                continue
+
+        if best_match is not None:
+            family_id, dist = best_match
+            similarity_score = 1.0 if dist == 0 else 0.6
+            now = datetime.now(timezone.utc)
+            self._db.conn.execute(
+                """
+                UPDATE incident_families
+                SET incident_count = incident_count + 1,
+                    last_confirmed_ts = ?
+                WHERE id = ?
+                """,
+                [now, family_id]
+            )
+            self._db.conn.execute(
+                """
+                UPDATE incident_patterns
+                SET family_id = ?, similarity_score = ?
+                WHERE id = ?
+                """,
+                [family_id, similarity_score, pattern_id]
+            )
+            return family_id, similarity_score
+
         family_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
 
@@ -136,7 +189,6 @@ class PatternStore:
             ],
         )
 
-        # Link pattern to new family
         self._db.conn.execute(
             """
             UPDATE incident_patterns
