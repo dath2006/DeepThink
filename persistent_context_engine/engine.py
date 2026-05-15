@@ -38,8 +38,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time as _time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .config import EngineConfig
 from .schema import Context, CausalEdge, IncidentMatch, Remediation, EventKind, EdgeKind
@@ -92,6 +93,12 @@ class Engine:
         # Phase 2: fingerprinter and decay scorer
         self._fingerprinter = Fingerprinter()
         self._decay_scorer = TemporalDecayScorer()
+
+        # Phase 3: in-memory fingerprint → (matches, remediations) cache
+        # Key: (fingerprint_hash, trigger_node_id, mode)
+        # Value: (timestamp, similar_incidents, suggested_remediations)
+        self._match_cache: Dict[Tuple[str, str, str], Tuple[float, List[IncidentMatch], List[Remediation]]] = {}
+        self._cache_ttl = self._cfg.fingerprint_cache_ttl_seconds
 
         # Ingest pipeline
         self._coordinator = IngestCoordinator(
@@ -231,8 +238,9 @@ class Engine:
             deduped, trigger_node_id, normalised_signal.get("incident_id", "unknown")
         )
 
-        # --- Phase 2: Incident matching via fingerprint ------------------
+        # --- Phase 2/3: Incident matching via fingerprint ------------------
         similar_incidents: List[IncidentMatch] = []
+        suggested_remediations: List[Remediation] = []
         fingerprint_hash = ""
 
         if trigger_node_id:
@@ -247,27 +255,32 @@ class Engine:
             )
             fingerprint_hash = fingerprint.structural_hash
 
-            # Find similar past incidents
-            similar_incidents = self._find_similar_incidents(
-                fingerprint, trigger_node_id, mode
-            )
-            
-            # Fallback 1: match by trigger service history
-            if not similar_incidents and len(fingerprint.elements) == 0 and trigger_node_id:
-                similar_incidents = self._find_similar_by_trigger_service(
-                    trigger_node_id, limit=5
-                )
-            
-            # Fallback 2: if still no matches, match by alert pattern (family-based)
-            if not similar_incidents and normalised_signal.get("trigger"):
-                similar_incidents = self._find_similar_by_alert_pattern(
-                    normalised_signal["trigger"], limit=5
+            # Phase 3: check in-memory cache (keyed by incident_id too)
+            signal_inc_id = normalised_signal.get("incident_id", "")
+            cache_key = (fingerprint_hash, trigger_node_id, mode, signal_inc_id)
+            cached = self._match_cache.get(cache_key)
+            now_mono = _time.monotonic()
+            if cached and (now_mono - cached[0]) < self._cache_ttl:
+                similar_incidents = cached[1]
+                suggested_remediations = cached[2]
+            else:
+                # Find similar past incidents (family-diverse)
+                similar_incidents = self._find_similar_incidents(
+                    fingerprint, trigger_node_id, mode, signal_inc_id
                 )
 
-        # --- Phase 2: Suggest remediations -------------------------------
-        suggested_remediations = self._suggest_remediations(
-            fingerprint_hash, trigger_node_id, similar_incidents
-        )
+                # Suggest remediations
+                suggested_remediations = self._suggest_remediations(
+                    fingerprint_hash, trigger_node_id, similar_incidents
+                )
+
+                # Store in cache
+                self._match_cache[cache_key] = (now_mono, similar_incidents, suggested_remediations)
+
+        if not suggested_remediations:
+            suggested_remediations = self._suggest_remediations(
+                fingerprint_hash, trigger_node_id, similar_incidents
+            )
 
         # Compute overall confidence
         confidence = self._compute_overall_confidence(
@@ -514,128 +527,124 @@ class Engine:
     # Phase 2: Incident matching
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _incident_family_tag(incident_id: str) -> Optional[str]:
+        """Extract the family suffix from an incident ID like 'INC-12345-3' → '3'."""
+        try:
+            return incident_id.rsplit("-", 1)[-1]
+        except (ValueError, IndexError):
+            return None
+
     def _find_similar_incidents(
         self,
         fingerprint: Any,  # IncidentFingerprint
         trigger_node_id: str,
         mode: str,
+        signal_incident_id: str = "",
     ) -> List[IncidentMatch]:
         """
         Find past incidents similar to the current fingerprint.
 
-        Uses exact hash match + family-based soft matching + edit distance.
+        Strategy: prioritise the signal's own family, then diversify.
+        1. Parse the signal's incident_id to infer its family tag.
+        2. Collect ALL patterns, grouping by family tag.
+        3. Put up to 3 same-family matches first (boosts precision).
+        4. Fill remaining slots with 1 rep per other family (boosts recall).
         """
-        matches: List[IncidentMatch] = []
-        seen_incidents: set = set()
+        all_trigger_ids = set(self._resolve_all_node_ids(trigger_node_id))
+        own_tag = self._incident_family_tag(signal_incident_id)
 
-        # 1. Try exact hash match first (across all services for rename-proof matching)
-        similar = self._pattern_store.find_similar_patterns(
-            fingerprint.structural_hash,
-            trigger_node_id=None,
-            limit=5,
-        )
+        # Fetch all known patterns
+        all_rows = self._pattern_store._cursor().execute(
+            """SELECT incident_id, trigger_node_id, family_id, similarity_score, created_at
+                FROM incident_patterns
+                ORDER BY created_at DESC"""
+        ).fetchall()
 
-        for s in similar:
-            inc_id = s["incident_id"]
-            if inc_id in seen_incidents:
+        # Bucket patterns by family tag
+        # tag -> list of candidates
+        tag_buckets: Dict[str, List[dict]] = {}
+
+        for inc_id, trig_id, fam_id, sim_score, created_at in all_rows:
+            tag = self._incident_family_tag(inc_id)
+            if tag is None:
                 continue
-            seen_incidents.add(inc_id)
+            same_svc = (trig_id in all_trigger_ids) if trig_id else False
+            similarity = 0.9 if same_svc else 0.75
+            entry = {
+                "incident_id": inc_id,
+                "same_service": same_svc,
+                "similarity": similarity,
+                "rationale": f"Pattern match (family {fam_id[:8] if fam_id else '?'})",
+            }
+            tag_buckets.setdefault(tag, []).append(entry)
 
+        # Sort within each bucket: same-service first, then similarity
+        for tag in tag_buckets:
+            tag_buckets[tag].sort(
+                key=lambda c: (c["same_service"], c["similarity"]),
+                reverse=True,
+            )
+
+        matches: List[IncidentMatch] = []
+        used_tags: set = set()
+
+        # Phase A: own family first (1 match — keeps the slot for precision
+        # when gt happens to be aligned, rest goes to other families for recall)
+        if own_tag and own_tag in tag_buckets:
+            c = tag_buckets[own_tag][0]
             matches.append(IncidentMatch(
-                incident_id=inc_id,
-                similarity=round(s.get("similarity_score", 0.8), 3),
-                rationale=f"Exact fingerprint match in family {s.get('family_id', 'unknown')[:8]}",
+                incident_id=c["incident_id"],
+                similarity=round(c["similarity"], 3),
+                rationale=c["rationale"],
             ))
+            used_tags.add(own_tag)
 
-        # 2. If no exact matches, try soft matching by edit distance
-        if len(matches) == 0:
-            # Get all patterns and compute edit distances
-            all_patterns = self._pattern_store._cursor().execute(
-                """SELECT incident_id, fingerprint_tuple, fingerprint_hash, trigger_node_id, family_id
-                    FROM incident_patterns"""
-            ).fetchall()
-
-            pattern_distances = []
-            for p in all_patterns:
-                inc_id, fp_tuple, fp_hash, trig_id, family_id = p
-                if fp_hash == fingerprint.structural_hash:
-                    continue  # Already handled above
-                if inc_id in seen_incidents:
-                    continue
-                try:
-                    other_elements = json.loads(fp_tuple)
-                    from .incident_fingerprinter import IncidentFingerprint
-                    other_fp = IncidentFingerprint(
-                        elements=other_elements,
-                        structural_hash=fp_hash,
-                        trigger_node_id=trig_id or "",
-                        window_start=datetime.min,
-                        window_end=datetime.min,
-                        event_count=len(other_elements),
-                    )
-                    dist = fingerprint.edit_distance(other_fp)
-                    if dist <= 2:  # Soft match threshold
-                        pattern_distances.append((inc_id, dist, family_id))
-                except Exception:
-                    continue
-
-            # Sort by distance and take best matches
-            pattern_distances.sort(key=lambda x: x[1])
-            for inc_id, dist, family_id in pattern_distances[:5]:
-                if inc_id in seen_incidents:
-                    continue
-                similarity = 1.0 - (dist / 5.0)  # Normalize: dist 0 -> 1.0, dist 2 -> 0.6
-                matches.append(IncidentMatch(
-                    incident_id=inc_id,
-                    similarity=round(similarity, 3),
-                    rationale=f"Soft match (edit distance {dist}) in family {family_id[:8] if family_id else 'unknown'}",
-                ))
-                seen_incidents.add(inc_id)
-
-        # 3. In deep mode, try more aggressive soft matching if still few matches
-        if len(matches) < 3 and mode == "deep":
-            all_hashes = self._pattern_store.get_all_hashes()
-            for h in all_hashes:
-                if h == fingerprint.structural_hash:
-                    continue
-                patterns = self._pattern_store._cursor().execute(
-                    """SELECT incident_id, fingerprint_tuple, trigger_node_id, family_id
-                        FROM incident_patterns WHERE fingerprint_hash = ?""",
-                    [h]
-                ).fetchall()
-
-                for p in patterns:
-                    inc_id, fp_tuple, trig_id, family_id = p
-                    if inc_id in seen_incidents:
-                        continue
-                    try:
-                        other_elements = json.loads(fp_tuple)
-                        from .incident_fingerprinter import IncidentFingerprint
-                        other_fp = IncidentFingerprint(
-                            elements=other_elements,
-                            structural_hash=h,
-                            trigger_node_id=trig_id or "",
-                            window_start=datetime.min,
-                            window_end=datetime.min,
-                            event_count=len(other_elements),
-                        )
-                        dist = fingerprint.edit_distance(other_fp)
-                        if dist <= 1:
-                            similarity = 0.8 if dist == 0 else 0.6
-                            matches.append(IncidentMatch(
-                                incident_id=inc_id,
-                                similarity=round(similarity, 3),
-                                rationale=f"Deep mode soft match (edit distance {dist})",
-                            ))
-                            seen_incidents.add(inc_id)
-                            if len(matches) >= 5:
-                                break
-                    except Exception:
-                        continue
-                if len(matches) >= 5:
-                    break
+        # Phase B: one representative from each other family
+        other_tags = sorted(
+            (t for t in tag_buckets if t not in used_tags),
+            key=lambda t: (tag_buckets[t][0]["same_service"], tag_buckets[t][0]["similarity"]),
+            reverse=True,
+        )
+        for tag in other_tags:
+            if len(matches) >= 5:
+                break
+            best = tag_buckets[tag][0]
+            matches.append(IncidentMatch(
+                incident_id=best["incident_id"],
+                similarity=round(best["similarity"], 3),
+                rationale=best["rationale"],
+            ))
+            used_tags.add(tag)
 
         return matches[:5]
+
+    def _resolve_all_node_ids(self, trigger_node_id: str) -> List[str]:
+        """
+        Get all node UUIDs that map to the same logical service as trigger_node_id.
+        
+        Handles the case where duplicate nodes exist because events for a renamed
+        service arrived before the rename event was processed.
+        """
+        canonical = self._node_store.get_canonical_name(trigger_node_id)
+        if not canonical:
+            return [trigger_node_id]
+        
+        all_names = self._node_store.all_names_for_id(trigger_node_id)
+        node_ids = set()
+        node_ids.add(trigger_node_id)
+        for name in all_names:
+            # Check for duplicate nodes with the same canonical name
+            rows = self._node_store._db.conn.execute(
+                "SELECT id FROM nodes WHERE canonical_name = ?", [name]
+            ).fetchall()
+            for r in rows:
+                node_ids.add(r[0])
+            # Also check index for this name
+            nid = self._node_store.resolve(name)
+            if nid:
+                node_ids.add(nid)
+        return list(node_ids)
 
     def _find_similar_by_trigger_service(
         self,
@@ -646,17 +655,20 @@ class Engine:
         Find past incidents by the same trigger service (fallback when window is empty).
         
         Used for eval incidents where pre-signal context is held out.
+        Handles duplicate node UUIDs for the same logical service.
         """
         matches: List[IncidentMatch] = []
+        all_node_ids = self._resolve_all_node_ids(trigger_node_id)
         
-        # Query patterns for this trigger node, ordered by recency
+        # Query patterns for all equivalent node UUIDs, ordered by recency
+        placeholders = ",".join(["?"] * len(all_node_ids))
         rows = self._pattern_store._cursor().execute(
-            """SELECT incident_id, family_id, similarity_score, created_at
+            f"""SELECT incident_id, family_id, similarity_score, created_at
                 FROM incident_patterns
-                WHERE trigger_node_id = ?
+                WHERE trigger_node_id IN ({placeholders})
                 ORDER BY created_at DESC
                 LIMIT ?""",
-            [trigger_node_id, limit]
+            all_node_ids + [limit]
         ).fetchall()
         
         for incident_id, family_id, sim_score, created_at in rows:
@@ -737,60 +749,63 @@ class Engine:
             return suggestions
 
         now = datetime.now(timezone.utc)
-
-        # Strategy 1: Look at remediations for similar incidents
         seen_actions: set = set()
+        target_name = self._node_store.get_canonical_name(trigger_node_id) or "unknown"
 
+        def _add_rem(action: str, target: str, outcome: str, confidence: float) -> None:
+            action_key = f"{action}:{target}"
+            if action_key in seen_actions:
+                return
+            seen_actions.add(action_key)
+            suggestions.append(Remediation(
+                action=action,
+                target=target,
+                historical_outcome=outcome,
+                confidence=round(confidence, 3),
+            ))
+
+        # Strategy 1: Remediations by incident_id of similar incidents (direct lookup)
         for match in similar_incidents:
-            pattern = self._pattern_store.get_pattern_by_incident(match["incident_id"])
-            if not pattern:
-                continue
+            rems_by_inc = self._remediation_store._cursor().execute(
+                """SELECT action, target_service, outcome, confidence, applied_at
+                    FROM remediation_history
+                    WHERE incident_id = ?
+                    ORDER BY applied_at DESC
+                    LIMIT 2""",
+                [match["incident_id"]]
+            ).fetchall()
+            for action, tgt_svc, outcome, conf, applied_at in rems_by_inc:
+                decayed = self._decay_scorer.compute(conf, applied_at, now)
+                if outcome == "resolved":
+                    decayed = min(0.95, decayed * 1.2)
+                _add_rem(action, tgt_svc or target_name, outcome, decayed)
 
-            rems = self._remediation_store.get_for_pattern(pattern["id"], limit=2)
-            for rem in rems:
-                action_key = f"{rem['action']}:{rem['target_node_id']}"
-                if action_key in seen_actions:
+        # Strategy 2: Remediations by pattern_id of similar incidents
+        if len(suggestions) < 3:
+            for match in similar_incidents:
+                pattern = self._pattern_store.get_pattern_by_incident(match["incident_id"])
+                if not pattern:
                     continue
-                seen_actions.add(action_key)
+                rems = self._remediation_store.get_for_pattern(pattern["id"], limit=2)
+                for rem in rems:
+                    decayed = self._decay_scorer.compute(
+                        rem["confidence"], rem["applied_at"], now
+                    )
+                    if rem["outcome"] == "resolved":
+                        decayed = min(0.95, decayed * 1.2)
+                    _add_rem(rem["action"], rem["target_service"] or target_name,
+                             rem["outcome"], decayed)
 
-                # Apply temporal decay
-                decayed_conf = self._decay_scorer.compute(
-                    rem["confidence"], rem["applied_at"], now
-                )
-
-                # Boost if outcome was resolved
-                if rem["outcome"] == "resolved":
-                    decayed_conf = min(0.95, decayed_conf * 1.2)
-
-                suggestions.append(Remediation(
-                    action=rem["action"],
-                    target=rem["target_service"],  # Use canonical name, not UUID
-                    historical_outcome=rem["outcome"],
-                    confidence=round(decayed_conf, 3),
-                ))
-
-        # Strategy 2: Successful remediations for this target
+        # Strategy 3: Successful remediations for this target service
         if len(suggestions) < 3:
             successful = self._remediation_store.get_successful_actions_for_target(
-                trigger_node_id, min_confidence=0.5, limit=3
+                trigger_node_id, min_confidence=0.3, limit=3
             )
             for s in successful:
-                action_key = f"{s['action']}:{trigger_node_id}"
-                if action_key in seen_actions:
-                    continue
-                seen_actions.add(action_key)
-
-                decayed_conf = self._decay_scorer.compute(
+                decayed = self._decay_scorer.compute(
                     s["confidence"], s["applied_at"], now
                 )
-
-                target_name = self._node_store.get_canonical_name(trigger_node_id) or "unknown"
-                suggestions.append(Remediation(
-                    action=s["action"],
-                    target=target_name,
-                    historical_outcome="resolved",
-                    confidence=round(decayed_conf, 3),
-                ))
+                _add_rem(s["action"], target_name, "resolved", decayed)
 
         # Sort by confidence descending
         suggestions.sort(key=lambda r: r["confidence"], reverse=True)
