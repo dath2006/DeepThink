@@ -54,12 +54,14 @@ class RawEventStore:
         """
         event_id = str(uuid.uuid4())
         service = raw.get("service")
+        # Use pre-serialized JSON if available (set by batch ingest)
+        raw_json = raw.get("_raw_json") or json.dumps(raw, default=_json_default)
         self._db.conn.execute(
             """
             INSERT INTO raw_events (id, ts, kind, service, raw_json)
             VALUES (?, ?, ?, ?, ?)
             """,
-            [event_id, ts, kind, service, json.dumps(raw, default=_json_default)],
+            [event_id, ts, kind, service, raw_json],
         )
         return event_id
 

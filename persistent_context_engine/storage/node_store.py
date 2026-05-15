@@ -53,19 +53,21 @@ class NodeStore:
     # Write  (called inside coordinator transaction)
     # ------------------------------------------------------------------
 
-    def get_or_create(self, service_name: str, ts: datetime) -> str:
+    def get_or_create(self, service_name: str, ts: datetime, skip_ts_update: bool = False) -> str:
         """
         Return the UUID for *service_name*, creating a new node if unseen.
 
-        If the node already exists, ``last_seen_ts`` is bumped to *ts*.
+        If the node already exists, ``last_seen_ts`` is bumped to *ts*
+        unless *skip_ts_update* is True (for batch ingest throughput).
         This call must run inside an open transaction.
         """
         node_id = self._name_to_id.get(service_name)
         if node_id is not None:
-            self._db.conn.execute(
-                "UPDATE nodes SET last_seen_ts = ? WHERE id = ?",
-                [ts, node_id],
-            )
+            if not skip_ts_update:
+                self._db.conn.execute(
+                    "UPDATE nodes SET last_seen_ts = ? WHERE id = ?",
+                    [ts, node_id],
+                )
             return node_id
 
         node_id = str(uuid.uuid4())

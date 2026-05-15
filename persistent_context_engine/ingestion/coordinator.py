@@ -29,11 +29,16 @@ unknown kinds   - raw store only (forward-compatible with held-out kinds)
 
 from __future__ import annotations
 
+import json as _json_mod
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from datetime import timedelta
+
+from ..storage.raw_store import _json_default
+
+_json_dumps = _json_mod.dumps
 
 from ..schema import EdgeKind, EventKind
 from ..storage.database import DatabaseManager
@@ -159,10 +164,111 @@ class IngestCoordinator:
         # ---- 5. Hot buffer -------------------------------------------
         self._buffer.push(event)
 
-    def ingest_many(self, events: Any) -> None:
-        """Ingest an iterable of events (benchmark's ingest entry point)."""
+    def ingest_many(self, events: Any, batch_size: int = 100) -> None:
+        """
+        Ingest an iterable of events with batched transactions.
+
+        Groups simple events (deploy, log, metric, trace) into batched
+        transactions for throughput.  Complex events (incident_signal,
+        topology, remediation) that need cross-table queries or
+        fingerprinting run in their own transaction for correctness.
+        """
+        batch_nx_ops: List[_NxOp] = []
+        batch_events: List[Dict[str, Any]] = []
+        batch_node_ts: Dict[str, datetime] = {}  # node_id -> max ts seen in batch
+        in_batch = False
+
+        def _flush_batch() -> None:
+            nonlocal in_batch
+            if not in_batch:
+                return
+            # Bulk-update last_seen_ts for all nodes touched in this batch
+            for nid, max_ts in batch_node_ts.items():
+                self._db.conn.execute(
+                    "UPDATE nodes SET last_seen_ts = ? WHERE id = ? AND last_seen_ts < ?",
+                    [max_ts, nid, max_ts],
+                )
+            self._db.commit()
+            self._apply_nx_ops(batch_nx_ops)
+            for be in batch_events:
+                self._buffer.push(be)
+            batch_nx_ops.clear()
+            batch_events.clear()
+            batch_node_ts.clear()
+            in_batch = False
+
         for raw in events:
-            self.ingest_one(raw)
+            try:
+                event = self._parser.normalise(raw)
+            except ParseError as exc:
+                log.warning("Skipping unparseable event: %s", exc)
+                continue
+
+            kind = event["kind"]
+
+            # Complex kinds need their own transaction (fingerprinting, cross-table)
+            if kind in (EventKind.INCIDENT_SIGNAL, EventKind.TOPOLOGY, EventKind.REMEDIATION):
+                _flush_batch()
+                self._ingest_parsed(event)
+                continue
+
+            # Simple kind: accumulate in batch
+            if not in_batch:
+                self._db.begin()
+                in_batch = True
+
+            ts = event["ts"]
+            # Pre-serialize JSON once for batch throughput
+            event["_raw_json"] = _json_dumps(event, default=_json_default)
+            event_id = self._raw.insert(event, ts, kind)
+
+            if kind == EventKind.DEPLOY:
+                nx_ops = self._handle_deploy_fast(event, ts, event_id, batch_node_ts)
+                batch_nx_ops += nx_ops
+            elif kind in (EventKind.LOG, EventKind.METRIC):
+                nx_ops = self._handle_service_event_fast(event, ts, event_id, batch_node_ts)
+                batch_nx_ops += nx_ops
+            elif kind == EventKind.TRACE:
+                batch_nx_ops += self._handle_trace(event, ts, event_id)
+            else:
+                pass  # Unknown kind stored raw
+
+            batch_events.append(event)
+
+            # Commit batch when full
+            if len(batch_events) >= batch_size:
+                _flush_batch()
+
+        # Flush remaining batch
+        _flush_batch()
+
+    def _ingest_parsed(self, event: Dict[str, Any]) -> None:
+        """Ingest a single pre-parsed event with its own transaction."""
+        ts = event["ts"]
+        kind = event["kind"]
+        nx_ops: List[_NxOp] = []
+
+        self._db.begin()
+        try:
+            event_id = self._raw.insert(event, ts, kind)
+
+            if kind == EventKind.TOPOLOGY:
+                nx_ops += self._handle_topology(event, ts, event_id)
+            elif kind == EventKind.INCIDENT_SIGNAL:
+                nx_ops += self._handle_incident_signal(event, ts, event_id)
+            elif kind == EventKind.REMEDIATION:
+                nx_ops += self._handle_remediation(event, ts, event_id)
+            else:
+                pass
+
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            log.exception("Transaction rolled back for event kind='%s'", kind)
+            return
+
+        self._apply_nx_ops(nx_ops)
+        self._buffer.push(event)
 
     # ------------------------------------------------------------------
     # Kind-specific handlers — return list of pending NetworkX ops
@@ -177,6 +283,21 @@ class IngestCoordinator:
         node_id = self._nodes.get_or_create(service, ts)
         return [("node", node_id, service, [])]
 
+    def _handle_deploy_fast(
+        self, event: Dict[str, Any], ts: datetime, event_id: str,
+        batch_node_ts: Dict[str, datetime],
+    ) -> List[_NxOp]:
+        """Batch-optimised deploy handler: skips per-event ts update."""
+        service = event.get("service")
+        if not service:
+            return []
+        node_id = self._nodes.get_or_create(service, ts, skip_ts_update=True)
+        # Track max ts per node for batch-end bulk update
+        prev = batch_node_ts.get(node_id)
+        if prev is None or ts > prev:
+            batch_node_ts[node_id] = ts
+        return [("node", node_id, service, [])]
+
     def _handle_service_event(
         self, event: Dict[str, Any], ts: datetime, event_id: str
     ) -> List[_NxOp]:
@@ -184,6 +305,20 @@ class IngestCoordinator:
         if not service:
             return []
         node_id = self._nodes.get_or_create(service, ts)
+        return [("node", node_id, service, [])]
+
+    def _handle_service_event_fast(
+        self, event: Dict[str, Any], ts: datetime, event_id: str,
+        batch_node_ts: Dict[str, datetime],
+    ) -> List[_NxOp]:
+        """Batch-optimised service event handler: skips per-event ts update."""
+        service = event.get("service")
+        if not service:
+            return []
+        node_id = self._nodes.get_or_create(service, ts, skip_ts_update=True)
+        prev = batch_node_ts.get(node_id)
+        if prev is None or ts > prev:
+            batch_node_ts[node_id] = ts
         return [("node", node_id, service, [])]
 
     def _handle_trace(
