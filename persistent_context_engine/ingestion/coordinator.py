@@ -494,6 +494,7 @@ class IngestCoordinator:
             window_start=fingerprint.window_start,
             window_end=fingerprint.window_end,
             event_count=fingerprint.event_count,
+            created_at=ts,
         )
 
         # Find or create family (scoped to trigger service + fingerprint hash)

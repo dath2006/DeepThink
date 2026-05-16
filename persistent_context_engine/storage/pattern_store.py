@@ -47,6 +47,7 @@ class PatternStore:
         window_start: datetime,
         window_end: datetime,
         event_count: int,
+        created_at: Optional[datetime] = None,
     ) -> str:
         """
         Insert a new pattern and return its UUID.
@@ -55,7 +56,7 @@ class PatternStore:
         of the events leading up to the incident.
         """
         pattern_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc)
+        created = created_at or datetime.now(timezone.utc)
 
         self._db.conn.execute(
             """
@@ -68,7 +69,7 @@ class PatternStore:
             [
                 pattern_id, incident_id, fingerprint_hash, fingerprint_tuple,
                 trigger_node_id, window_start, window_end,
-                None, 0.0, event_count, now
+                None, 0.0, event_count, created
             ],
         )
         return pattern_id

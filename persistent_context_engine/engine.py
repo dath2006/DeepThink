@@ -268,11 +268,12 @@ class Engine:
                 similar_incidents = self._find_similar_incidents(
                     fingerprint, trigger_node_id, mp,
                     signal_incident_id=signal_inc_id,
+                    reference_ts=incident_ts,
                 )
 
                 suggested_remediations = self._suggest_remediations(
                     fingerprint.structural_hash, trigger_node_id,
-                    similar_incidents, mp,
+                    similar_incidents, mp, reference_ts=incident_ts,
                 )
 
                 self._match_cache[cache_key] = (now_mono, similar_incidents, suggested_remediations)
@@ -280,8 +281,14 @@ class Engine:
         if not suggested_remediations:
             suggested_remediations = self._suggest_remediations(
                 fingerprint.structural_hash if fingerprint else "",
-                trigger_node_id, similar_incidents, mp,
+                trigger_node_id, similar_incidents, mp, reference_ts=incident_ts,
             )
+
+        # Uncertainty-aware abstention: when nearest historical matches are
+        # weak/ambiguous, prefer returning no confident matches or remediations.
+        if self._should_abstain(similar_incidents):
+            similar_incidents = []
+            suggested_remediations = []
 
         # Compute overall confidence
         confidence = self._compute_overall_confidence(
@@ -775,6 +782,7 @@ class Engine:
         trigger_node_id: str,
         mp: ModeParams,
         signal_incident_id: str = "",
+        reference_ts: Optional[datetime] = None,
     ) -> List[IncidentMatch]:
         """
         Find past incidents similar to the current fingerprint.
@@ -789,12 +797,22 @@ class Engine:
         all_trigger_ids = set(self._resolve_all_node_ids(trigger_node_id))
 
         # Fetch all known patterns with fingerprint data
-        all_rows = self._pattern_store._cursor().execute(
-            """SELECT p.incident_id, p.trigger_node_id, p.family_id,
-                      p.fingerprint_hash, p.fingerprint_tuple, p.created_at
-               FROM incident_patterns p
-               ORDER BY p.created_at DESC"""
-        ).fetchall()
+        if reference_ts is not None:
+            all_rows = self._pattern_store._cursor().execute(
+                """SELECT p.incident_id, p.trigger_node_id, p.family_id,
+                          p.fingerprint_hash, p.fingerprint_tuple, p.created_at
+                   FROM incident_patterns p
+                   WHERE p.created_at < ?
+                   ORDER BY p.created_at DESC""",
+                [reference_ts]
+            ).fetchall()
+        else:
+            all_rows = self._pattern_store._cursor().execute(
+                """SELECT p.incident_id, p.trigger_node_id, p.family_id,
+                          p.fingerprint_hash, p.fingerprint_tuple, p.created_at
+                   FROM incident_patterns p
+                   ORDER BY p.created_at DESC"""
+            ).fetchall()
 
         if not all_rows:
             return []
@@ -824,7 +842,7 @@ class Engine:
                 "family_id": fam_id,
                 "fingerprint_hash": fp_hash,
                 "trigger_node_id": trig_id,
-                "similarity": max(similarity, 0.05),
+                "similarity": similarity,
                 "raw_similarity": similarity,
                 "same_service": same_svc,
                 "rationale": self._build_match_rationale(
@@ -839,63 +857,14 @@ class Engine:
         # fallback that maintains recall@5.
         candidates.sort(key=lambda c: (c["similarity"], c["same_service"]), reverse=True)
 
-        matches: List[IncidentMatch] = []
-        used_ids: set = set()
-        used_triggers: set = set()
-        used_families: set = set()
-        used_composite: set = set()
-
-        def _add_match(c: Dict[str, Any]) -> bool:
-            if c["incident_id"] in used_ids or len(matches) >= mp.match_limit:
-                return False
-            used_ids.add(c["incident_id"])
-            matches.append(IncidentMatch(
+        return [
+            IncidentMatch(
                 incident_id=c["incident_id"],
                 similarity=round(c["similarity"], 3),
                 rationale=c["rationale"],
-            ))
-            trig_id = c.get("trigger_node_id") or ""
-            trig_name = (self._node_store.get_canonical_name(trig_id)
-                         if trig_id else "unknown") or trig_id or "unknown"
-            used_triggers.add(trig_name)
-            used_families.add(c["family_id"])
-            used_composite.add((trig_name, c["family_id"]))
-            return True
-
-        # Pass 1: one best match per distinct composite key (trigger × family).
-        for c in candidates:
-            trig_id = c.get("trigger_node_id") or ""
-            trig_name = (self._node_store.get_canonical_name(trig_id)
-                         if trig_id else "unknown") or trig_id or "unknown"
-            key = (trig_name, c["family_id"])
-            if key in used_composite:
-                continue
-            _add_match(c)
-            if len(matches) >= mp.match_limit:
-                break
-
-        # Pass 2: one per remaining trigger service
-        if len(matches) < mp.match_limit:
-            for c in candidates:
-                trig_id = c.get("trigger_node_id") or ""
-                trig_name = (self._node_store.get_canonical_name(trig_id)
-                             if trig_id else "unknown") or trig_id or "unknown"
-                if trig_name in used_triggers:
-                    continue
-                _add_match(c)
-                if len(matches) >= mp.match_limit:
-                    break
-
-        # Pass 3: fill remaining slots with highest-similarity not yet included
-        if len(matches) < mp.match_limit:
-            for c in candidates:
-                if c["incident_id"] in used_ids:
-                    continue
-                _add_match(c)
-                if len(matches) >= mp.match_limit:
-                    break
-
-        return matches
+            )
+            for c in candidates[: mp.match_limit]
+        ]
 
     def _compute_pattern_similarity(
         self,
@@ -926,6 +895,32 @@ class Engine:
             return compute_similarity(current_fp, candidate_fp)
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _should_abstain(similar_incidents: List[IncidentMatch]) -> bool:
+        """
+        Return True when retrieval confidence is too weak/ambiguous.
+
+        This is intentionally generic:
+        - no strong top match
+        - or top-2 are both low and close (no clear winner)
+        """
+        if not similar_incidents:
+            return True
+
+        sims = [float(m.get("similarity", 0.0)) for m in similar_incidents]
+        top = sims[0]
+        second = sims[1] if len(sims) > 1 else 0.0
+
+        # Strong nearest neighbor: keep results.
+        if top >= 0.62:
+            return False
+
+        # Weak top-1 and no clear separation from top-2: abstain.
+        if top < 0.5:
+            return True
+
+        return (top - second) < 0.08
 
     @staticmethod
     def _build_match_rationale(
@@ -979,6 +974,7 @@ class Engine:
         trigger_node_id: Optional[str],
         similar_incidents: List[IncidentMatch],
         mp: ModeParams = None,
+        reference_ts: Optional[datetime] = None,
     ) -> List[Remediation]:
         """
         Suggest remediations based on historical outcomes.
@@ -990,7 +986,7 @@ class Engine:
         if not trigger_node_id:
             return suggestions
 
-        now = datetime.now(timezone.utc)
+        now = reference_ts or datetime.now(timezone.utc)
         seen_actions: set = set()
         target_name = self._node_store.get_canonical_name(trigger_node_id) or "unknown"
 
@@ -1011,10 +1007,10 @@ class Engine:
             rems_by_inc = self._remediation_store._cursor().execute(
                 """SELECT action, target_service, outcome, confidence, applied_at
                     FROM remediation_history
-                    WHERE incident_id = ?
+                    WHERE incident_id = ? AND applied_at < ?
                     ORDER BY applied_at DESC
                     LIMIT 2""",
-                [match["incident_id"]]
+                [match["incident_id"], now]
             ).fetchall()
             for action, tgt_svc, outcome, conf, applied_at in rems_by_inc:
                 decayed = self._decay_scorer.compute(conf, applied_at, now)
@@ -1030,6 +1026,8 @@ class Engine:
                     continue
                 rems = self._remediation_store.get_for_pattern(pattern["id"], limit=2)
                 for rem in rems:
+                    if rem["applied_at"] >= now:
+                        continue
                     decayed = self._decay_scorer.compute(
                         rem["confidence"], rem["applied_at"], now
                     )
@@ -1044,6 +1042,8 @@ class Engine:
                 trigger_node_id, min_confidence=0.3, limit=3
             )
             for s in successful:
+                if s["applied_at"] >= now:
+                    continue
                 decayed = self._decay_scorer.compute(
                     s["confidence"], s["applied_at"], now
                 )
@@ -1060,6 +1060,8 @@ class Engine:
                     nid, min_confidence=0.3, limit=2
                 )
                 for s in successful:
+                    if s["applied_at"] >= now:
+                        continue
                     decayed = self._decay_scorer.compute(
                         s["confidence"], s["applied_at"], now
                     )
@@ -1192,3 +1194,5 @@ class Engine:
             "families":      self._pattern_store.count_families(),
             "remediations":  self._remediation_store.count(),
         }
+
+
