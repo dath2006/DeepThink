@@ -39,6 +39,7 @@ import json
 import logging
 import re
 import time as _time
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -55,7 +56,7 @@ from .graph.temporal_view import TemporalGraphView
 from .ingestion.coordinator import IngestCoordinator
 from .ingestion.buffer import RecentEventsBuffer
 from .ingestion.parser import EventParser
-from .incident_fingerprinter import Fingerprinter, compute_similarity
+from .incident_fingerprinter import Fingerprinter, IncidentFingerprint, compute_similarity
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +100,7 @@ class Engine:
         # Value: (timestamp, similar_incidents, suggested_remediations)
         self._match_cache: Dict[Tuple[str, str, str], Tuple[float, List[IncidentMatch], List[Remediation]]] = {}
         self._cache_ttl = self._cfg.fingerprint_cache_ttl_seconds
+        self._abstain_threshold_cache: Dict[str, Tuple[int, float]] = {}
 
         # Ingest pipeline
         self._coordinator = IngestCoordinator(
@@ -286,7 +288,8 @@ class Engine:
 
         # Uncertainty-aware abstention: when nearest historical matches are
         # weak/ambiguous, prefer returning no confident matches or remediations.
-        if self._should_abstain(similar_incidents):
+        abstain_threshold = self._compute_calibrated_abstain_threshold(incident_ts)
+        if self._should_abstain(similar_incidents, abstain_threshold):
             similar_incidents = []
             suggested_remediations = []
 
@@ -802,7 +805,12 @@ class Engine:
                 """SELECT p.incident_id, p.trigger_node_id, p.family_id,
                           p.fingerprint_hash, p.fingerprint_tuple, p.created_at
                    FROM incident_patterns p
-                   WHERE p.created_at < ?
+                   WHERE EXISTS (
+                       SELECT 1 FROM remediation_history r
+                       WHERE r.incident_id = p.incident_id
+                   )
+                     AND
+                         p.created_at < ?
                    ORDER BY p.created_at DESC""",
                 [reference_ts]
             ).fetchall()
@@ -811,6 +819,10 @@ class Engine:
                 """SELECT p.incident_id, p.trigger_node_id, p.family_id,
                           p.fingerprint_hash, p.fingerprint_tuple, p.created_at
                    FROM incident_patterns p
+                   WHERE EXISTS (
+                       SELECT 1 FROM remediation_history r
+                       WHERE r.incident_id = p.incident_id
+                   )
                    ORDER BY p.created_at DESC"""
             ).fetchall()
 
@@ -896,8 +908,85 @@ class Engine:
         except Exception:
             return 0.0
 
+    def _compute_calibrated_abstain_threshold(self, reference_ts: datetime) -> float:
+        """
+        Estimate an adaptive similarity threshold from prior closed incidents.
+
+        We approximate split-conformal style calibration:
+        - Use only incidents closed before reference_ts
+        - Compute each incident's best similarity to earlier closed incidents
+        - Use a lower quantile as abstention threshold
+        """
+        try:
+            rows = self._pattern_store._cursor().execute(
+                """
+                SELECT p.incident_id, p.fingerprint_hash, p.fingerprint_tuple, p.created_at
+                FROM incident_patterns p
+                WHERE p.created_at < ?
+                  AND EXISTS (
+                    SELECT 1 FROM remediation_history r
+                    WHERE r.incident_id = p.incident_id
+                      AND r.applied_at < ?
+                  )
+                ORDER BY p.created_at ASC
+                """,
+                [reference_ts, reference_ts],
+            ).fetchall()
+        except Exception:
+            return 0.58
+
+        n = len(rows)
+        if n < 8:
+            return 0.58
+
+        cache_key = reference_ts.strftime("%Y-%m-%dT%H")
+        cached = self._abstain_threshold_cache.get(cache_key)
+        if cached and cached[0] == n:
+            return cached[1]
+
+        historical_best: List[float] = []
+        for i in range(1, n):
+            inc_id_i, fp_hash_i, fp_tuple_i, _ = rows[i]
+            try:
+                elems_i = json.loads(fp_tuple_i)
+                fp_i = IncidentFingerprint(
+                    elements=elems_i,
+                    structural_hash=fp_hash_i,
+                    trigger_node_id="",
+                    window_start=reference_ts,
+                    window_end=reference_ts,
+                    event_count=len(elems_i),
+                )
+            except Exception:
+                continue
+
+            best = 0.0
+            for j in range(i):
+                inc_id_j, fp_hash_j, fp_tuple_j, _ = rows[j]
+                if inc_id_i == inc_id_j:
+                    continue
+                sim = self._compute_pattern_similarity(fp_i, fp_hash_j, fp_tuple_j)
+                if sim > best:
+                    best = sim
+            if best > 0:
+                historical_best.append(best)
+
+        if len(historical_best) < 6:
+            return 0.58
+
+        historical_best.sort()
+        q = 0.15  # keep roughly top 85% ID coverage; abstain on low-tail
+        idx = max(0, min(len(historical_best) - 1, int(math.floor(q * (len(historical_best) - 1)))))
+        thr = historical_best[idx]
+        thr = max(0.5, min(0.75, float(thr)))
+        self._abstain_threshold_cache[cache_key] = (n, thr)
+        return thr
+
     @staticmethod
-    def _should_abstain(similar_incidents: List[IncidentMatch]) -> bool:
+    def _should_abstain(
+        similar_incidents: List[IncidentMatch],
+        threshold: float,
+    ) -> bool:
         """
         Return True when retrieval confidence is too weak/ambiguous.
 
@@ -912,15 +1001,16 @@ class Engine:
         top = sims[0]
         second = sims[1] if len(sims) > 1 else 0.0
 
-        # Strong nearest neighbor: keep results.
-        if top >= 0.62:
+        # Strong nearest neighbor above calibrated threshold: keep results.
+        if top >= threshold + 0.08:
             return False
 
-        # Weak top-1 and no clear separation from top-2: abstain.
-        if top < 0.5:
+        # Weak top-1 below calibrated threshold: abstain.
+        if top < threshold:
             return True
 
-        return (top - second) < 0.08
+        # Around-threshold predictions require clear separation.
+        return (top - second) < 0.10
 
     @staticmethod
     def _build_match_rationale(
