@@ -223,13 +223,14 @@ CREATE TABLE IF NOT EXISTS edges (
 """
 
 INDEX_DDL: List[str] = [
-    "CREATE INDEX IF NOT EXISTS idx_re_ts      ON raw_events(ts)",
-    "CREATE INDEX IF NOT EXISTS idx_re_kind    ON raw_events(kind)",
-    "CREATE INDEX IF NOT EXISTS idx_re_service ON raw_events(service)",
-    "CREATE INDEX IF NOT EXISTS idx_n_name     ON nodes(canonical_name)",
-    "CREATE INDEX IF NOT EXISTS idx_e_src      ON edges(source_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_e_dst      ON edges(target_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_e_kind     ON edges(edge_kind)",
+    "CREATE INDEX IF NOT EXISTS idx_re_ts          ON raw_events(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_re_ts_svc      ON raw_events(ts, service)",
+    "CREATE INDEX IF NOT EXISTS idx_re_kind        ON raw_events(kind)",
+    "CREATE INDEX IF NOT EXISTS idx_re_service     ON raw_events(service)",
+    "CREATE INDEX IF NOT EXISTS idx_n_name         ON nodes(canonical_name)",
+    "CREATE INDEX IF NOT EXISTS idx_e_src          ON edges(source_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_e_dst          ON edges(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_e_kind         ON edges(edge_kind)",
 ]
 
 # Phase 2: Incident patterns and families DDL
@@ -275,11 +276,14 @@ CREATE TABLE IF NOT EXISTS remediation_history (
 """
 
 PATTERN_INDEX_DDL: List[str] = [
-    "CREATE INDEX IF NOT EXISTS idx_ip_hash    ON incident_patterns(fingerprint_hash)",
-    "CREATE INDEX IF NOT EXISTS idx_ip_family  ON incident_patterns(family_id)",
-    "CREATE INDEX IF NOT EXISTS idx_ip_inc   ON incident_patterns(incident_id)",
-    "CREATE INDEX IF NOT EXISTS idx_if_hash    ON incident_families(family_hash, trigger_node_id)",
-    "CREATE INDEX IF NOT EXISTS idx_rh_inc     ON remediation_history(incident_id)",
-    "CREATE INDEX IF NOT EXISTS idx_rh_pattern ON remediation_history(pattern_id)",
-    "CREATE INDEX IF NOT EXISTS idx_rh_target  ON remediation_history(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_hash       ON incident_patterns(fingerprint_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_family     ON incident_patterns(family_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_inc        ON incident_patterns(incident_id)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_created    ON incident_patterns(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_ip_trig_hash  ON incident_patterns(trigger_node_id, fingerprint_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_if_hash       ON incident_families(family_hash, trigger_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_inc        ON remediation_history(incident_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_pattern    ON remediation_history(pattern_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_target     ON remediation_history(target_node_id)",
+    "CREATE INDEX IF NOT EXISTS idx_rh_applied    ON remediation_history(applied_at)",
 ]

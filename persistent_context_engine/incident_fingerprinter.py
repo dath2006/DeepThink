@@ -141,7 +141,13 @@ class Fingerprinter:
         for ev in events:
             ev_ts = ev.get("ts")
             if not isinstance(ev_ts, datetime):
-                continue
+                if isinstance(ev_ts, str):
+                    try:
+                        ev_ts = datetime.fromisoformat(ev_ts.replace("Z", "+00:00"))
+                    except (ValueError, AttributeError):
+                        continue
+                else:
+                    continue
             if ev_ts < window_start or ev_ts > window_end:
                 continue
 

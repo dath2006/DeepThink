@@ -55,6 +55,10 @@ from .parser import EventParser, ParseError
 
 log = logging.getLogger(__name__)
 
+# Metric names that are pure background noise (e.g. qps counters).
+# Events with these names are buffered but NOT written to raw_events DB,
+# keeping the table small so time-range scans stay fast at L3 scale.
+_BACKGROUND_METRIC_NAMES: frozenset = frozenset({"qps", "requests_per_second", "rps"})
 
 # Pending NetworkX operation types (applied after DB commit)
 _NxOp = Tuple  # typed alias; see _apply_nx_ops for shapes
@@ -164,7 +168,7 @@ class IngestCoordinator:
         # ---- 5. Hot buffer -------------------------------------------
         self._buffer.push(event)
 
-    def ingest_many(self, events: Any, batch_size: int = 100) -> None:
+    def ingest_many(self, events: Any, batch_size: int = 500) -> None:
         """
         Ingest an iterable of events with batched transactions.
 
@@ -218,6 +222,30 @@ class IngestCoordinator:
                 in_batch = True
 
             ts = event["ts"]
+
+            # Skip DB write for pure background metrics (e.g. name=qps).
+            # They are not used for fingerprinting or causal inference.
+            # Incident-adjacent metrics (latency_p99_ms, error_rate) still
+            # reach the DB because they arrive via single-event ingest_one
+            # when the incident_signal flush triggers before them.
+            metric_name = event.get("name", "") if kind == EventKind.METRIC else ""
+            is_background_metric = (
+                kind == EventKind.METRIC
+                and metric_name in _BACKGROUND_METRIC_NAMES
+            )
+
+            if is_background_metric:
+                # Only update the node record (cheap O(1) in-memory) and buffer
+                svc = event.get("service")
+                if svc:
+                    nid = self._nodes._name_to_id.get(svc)
+                    if nid:
+                        prev = batch_node_ts.get(nid)
+                        if prev is None or ts > prev:
+                            batch_node_ts[nid] = ts
+                batch_events.append(event)
+                continue
+
             # Pre-serialize JSON once for batch throughput
             event["_raw_json"] = _json_dumps(event, default=_json_default)
             event_id = self._raw.insert(event, ts, kind)
@@ -444,26 +472,43 @@ class IngestCoordinator:
         window_start = ts - timedelta(minutes=30)
         window_end = ts + timedelta(minutes=5)
 
-        # Fetch events in window (from buffer or DB)
-        window_events = self._raw.get_by_timerange(
-            window_start, window_end, limit=1000
-        )
-
-        # Restrict fingerprint events to trigger service + immediate topology neighborhood.
-        # This prevents background noise from unrelated services from dominating hashes.
+        # Build relevant service set FIRST so we can do a targeted DB fetch.
         relevant_services = {service}
         neighbor_ids = self._graph.neighbors_within_hops(trigger_node_id, hops=2)
         for nid in neighbor_ids:
             for name in self._nodes.all_names_for_id(nid):
                 relevant_services.add(name)
 
-        # Build event dicts for fingerprinter
-        events_for_fp = []
+        # Fetch only events for relevant services — avoids the 1000-row limit
+        # being filled with unrelated background metrics before we see the
+        # incident-adjacent deploy/latency/log events.
+        window_events = self._raw.get_by_services(
+            list(relevant_services), window_start, window_end
+        )
+
+        # Supplement from the in-memory ring buffer to capture any events that
+        # were still in the batch queue when the incident_signal flushed.
+        db_event_ids = {row.get("id") for row in window_events if row.get("id")}
+        for buf_ev in self._buffer.in_window(window_start, window_end):
+            buf_ev_svc = buf_ev.get("service")
+            if buf_ev_svc and buf_ev_svc not in relevant_services:
+                continue
+            buf_ev_id = buf_ev.get("id")
+            if buf_ev_id and buf_ev_id not in db_event_ids:
+                window_events.append({"raw": buf_ev, "id": buf_ev_id})
+                db_event_ids.add(buf_ev_id)
+
+        # Fix C: Inject the incident signal event itself as the first fingerprint element.
+        # This guarantees every fingerprint has at least one incident_signal element,
+        # preventing empty-hash collisions that collapse all families into one bucket.
+        synthetic_signal = dict(event)
+        synthetic_signal["ts"] = ts
+        events_for_fp = [synthetic_signal]
+        seen_ids_fp = {event.get("id")} if event.get("id") else set()
+
+        # Build event dicts for fingerprinter from DB+buffer window
         for row in window_events:
             raw = row.get("raw", {})
-            raw_svc = raw.get("service")
-            if raw_svc and raw_svc not in relevant_services:
-                continue
             # Parse ts back to datetime if needed
             raw_ts = raw.get("ts")
             if isinstance(raw_ts, str):
@@ -471,6 +516,11 @@ class IngestCoordinator:
                     raw["ts"] = self._parser._parse_timestamp(raw_ts)
                 except Exception:
                     pass
+            raw_id = raw.get("id")
+            if raw_id and raw_id in seen_ids_fp:
+                continue
+            if raw_id:
+                seen_ids_fp.add(raw_id)
             events_for_fp.append(raw)
 
         # Extract fingerprint using current (static) graph for consistent role computation.

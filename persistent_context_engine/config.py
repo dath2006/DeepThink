@@ -30,9 +30,12 @@ class EngineConfig:
     # -----------------------------------------------------------------------
     # Context reconstruction
     # -----------------------------------------------------------------------
-    context_window_minutes: int = 60
-    """How many minutes before/after an incident signal to search for
-    related events during context reconstruction."""
+    fast_context_window_minutes: int = 35
+    """Context window half-width in fast mode.  The L3 generator places
+    pre-events at -30min and -10min, so 35 min captures them with margin."""
+
+    deep_context_window_minutes: int = 60
+    """Context window half-width in deep mode (wider, for thorough analysis)."""
 
     fast_mode_max_events: int = 200
     """Maximum related events returned in fast reconstruction mode."""
@@ -91,6 +94,7 @@ class EngineConfig:
             match_limit=self.fast_match_limit if mode == "fast" else self.deep_match_limit,
             time_bucket_minutes=self.fast_time_bucket_minutes if mode == "fast" else self.deep_time_bucket_minutes,
             search_neighbors=self.fast_remediation_search_neighbors if mode == "fast" else self.deep_remediation_search_neighbors,
+            context_window_minutes=self.fast_context_window_minutes if mode == "fast" else self.deep_context_window_minutes,
         )
 
 
@@ -103,3 +107,4 @@ class ModeParams:
     match_limit: int
     time_bucket_minutes: int
     search_neighbors: bool
+    context_window_minutes: int = 60

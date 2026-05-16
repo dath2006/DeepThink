@@ -39,7 +39,6 @@ import json
 import logging
 import re
 import time as _time
-import math
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -56,7 +55,7 @@ from .graph.temporal_view import TemporalGraphView
 from .ingestion.coordinator import IngestCoordinator
 from .ingestion.buffer import RecentEventsBuffer
 from .ingestion.parser import EventParser
-from .incident_fingerprinter import Fingerprinter, IncidentFingerprint, compute_similarity
+from .incident_fingerprinter import Fingerprinter, compute_similarity
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +99,6 @@ class Engine:
         # Value: (timestamp, similar_incidents, suggested_remediations)
         self._match_cache: Dict[Tuple[str, str, str], Tuple[float, List[IncidentMatch], List[Remediation]]] = {}
         self._cache_ttl = self._cfg.fingerprint_cache_ttl_seconds
-        self._abstain_threshold_cache: Dict[str, Tuple[int, float]] = {}
 
         # Ingest pipeline
         self._coordinator = IngestCoordinator(
@@ -159,9 +157,9 @@ class Engine:
         if isinstance(incident_ts, str):
             incident_ts = parser._parse_timestamp(incident_ts)
 
-        window = timedelta(minutes=self._cfg.context_window_minutes)
+        window = timedelta(minutes=mp.context_window_minutes)
         start_ts = incident_ts - window
-        end_ts   = incident_ts + window
+        end_ts   = incident_ts + timedelta(minutes=5)
 
         # --- Identify relevant services and expand via graph ----------
         anchor_services: List[str] = []
@@ -199,14 +197,15 @@ class Engine:
                     related.append(e)
                     seen_ids.add(eid)
 
-        rows = self._raw_store.get_by_timerange(start_ts, end_ts, limit=mp.max_events)
         seen_ids = {e.get("id") or id(e) for e in related}
-        allowed_services = set(expanded_services)
-        for r in rows:
+        if expanded_services:
+            db_rows = self._raw_store.get_by_services(
+                list(expanded_services), start_ts, end_ts
+            )
+        else:
+            db_rows = self._raw_store.get_by_timerange(start_ts, end_ts, limit=mp.max_events)
+        for r in db_rows:
             ev = r["raw"]
-            ev_svc = ev.get("service")
-            if allowed_services and ev_svc and ev_svc not in allowed_services:
-                continue
             eid = ev.get("id") or id(ev)
             if eid not in seen_ids:
                 related.append(ev)
@@ -288,8 +287,7 @@ class Engine:
 
         # Uncertainty-aware abstention: when nearest historical matches are
         # weak/ambiguous, prefer returning no confident matches or remediations.
-        abstain_threshold = self._compute_calibrated_abstain_threshold(incident_ts)
-        if self._should_abstain(similar_incidents, abstain_threshold):
+        if self._should_abstain(similar_incidents, fingerprint=fingerprint):
             similar_incidents = []
             suggested_remediations = []
 
@@ -799,84 +797,99 @@ class Engine:
         """
         all_trigger_ids = set(self._resolve_all_node_ids(trigger_node_id))
 
-        # Fetch all known patterns with fingerprint data
+        cursor = self._pattern_store._cursor()
+
+        # Build query: all train patterns created before the eval signal.
+        # NO remediation filter — train incidents may not have remediations yet
+        # at the time we scan (they arrive +20min after the signal).
+        params: List[Any] = []
+        where_parts: List[str] = []
+
         if reference_ts is not None:
-            all_rows = self._pattern_store._cursor().execute(
-                """SELECT p.incident_id, p.trigger_node_id, p.family_id,
-                          p.fingerprint_hash, p.fingerprint_tuple, p.created_at
-                   FROM incident_patterns p
-                   WHERE EXISTS (
-                       SELECT 1 FROM remediation_history r
-                       WHERE r.incident_id = p.incident_id
-                   )
-                     AND
-                         p.created_at < ?
-                   ORDER BY p.created_at DESC""",
-                [reference_ts]
-            ).fetchall()
-        else:
-            all_rows = self._pattern_store._cursor().execute(
-                """SELECT p.incident_id, p.trigger_node_id, p.family_id,
-                          p.fingerprint_hash, p.fingerprint_tuple, p.created_at
-                   FROM incident_patterns p
-                   WHERE EXISTS (
-                       SELECT 1 FROM remediation_history r
-                       WHERE r.incident_id = p.incident_id
-                   )
-                   ORDER BY p.created_at DESC"""
-            ).fetchall()
+            where_parts.append("p.created_at < ?")
+            params.append(reference_ts)
+
+        where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+        all_rows = cursor.execute(
+            f"""SELECT p.incident_id, p.trigger_node_id, p.family_id,
+                       p.fingerprint_hash, p.fingerprint_tuple, p.created_at
+                FROM incident_patterns p
+                {where_clause}
+                ORDER BY p.created_at DESC""",
+            params,
+        ).fetchall()
 
         if not all_rows:
             return []
 
         # Score each candidate by genuine fingerprint similarity
         candidates: List[Dict[str, Any]] = []
-        for inc_id, trig_id, fam_id, fp_hash, fp_tuple, created_at in all_rows:
-            # Skip self
+        for inc_id, trig_id, fam_id, fp_hash, fp_tuple, _ in all_rows:
             if inc_id == signal_incident_id:
                 continue
 
-            # Compute genuine similarity
             similarity = self._compute_pattern_similarity(
                 fingerprint, fp_hash, fp_tuple
             )
 
-            # Boost for same trigger service
-            same_svc = (trig_id in all_trigger_ids) if trig_id else False
+            same_svc = bool(trig_id and trig_id in all_trigger_ids)
             if same_svc:
-                similarity = min(1.0, similarity + 0.05)
+                similarity = min(1.0, similarity + 0.15)
 
-            # Floor: even dissimilar patterns get a base score so family
-            # diversification can still find a representative per family.
-            # The actual similarity score remains truthful in the output.
             candidates.append({
                 "incident_id": inc_id,
-                "family_id": fam_id,
+                "family_id":   fam_id or "",
                 "fingerprint_hash": fp_hash,
-                "trigger_node_id": trig_id,
-                "similarity": similarity,
-                "raw_similarity": similarity,
+                "trigger_node_id":  trig_id,
+                "similarity":  similarity,
                 "same_service": same_svc,
-                "rationale": self._build_match_rationale(
-                    similarity, same_svc, fam_id
-                ),
+                "rationale": self._build_match_rationale(similarity, same_svc, fam_id),
             })
 
-        # Sort by (similarity DESC, same_service DESC) so within equal-similarity
-        # tiers (which occur when all fingerprints hash identically), same-trigger
-        # candidates rank ahead of wrong-service candidates. This biases early
-        # slots toward the correct family without removing the cross-service
-        # fallback that maintains recall@5.
+        # Sort: similarity DESC, same_service as tiebreaker
         candidates.sort(key=lambda c: (c["similarity"], c["same_service"]), reverse=True)
 
-        return [
-            IncidentMatch(
+        # Multi-pass diversification: one best representative per (trigger × family)
+        matches: List[IncidentMatch] = []
+        used_ids: set = set()
+        used_composite: set = set()
+
+        def _composite_key(c: Dict[str, Any]) -> tuple:
+            trig_name = (
+                self._node_store.get_canonical_name(c["trigger_node_id"])
+                if c["trigger_node_id"] else "unknown"
+            ) or "unknown"
+            return (trig_name, c["family_id"])
+
+        def _add(c: Dict[str, Any]) -> bool:
+            if c["incident_id"] in used_ids or len(matches) >= mp.match_limit:
+                return False
+            used_ids.add(c["incident_id"])
+            used_composite.add(_composite_key(c))
+            matches.append(IncidentMatch(
                 incident_id=c["incident_id"],
                 similarity=round(c["similarity"], 3),
                 rationale=c["rationale"],
-            )
-            for c in candidates[: mp.match_limit]
-        ]
+            ))
+            return True
+
+        # Pass 1: one per distinct (trigger_service × family), best sim first
+        for c in candidates:
+            if _composite_key(c) not in used_composite:
+                _add(c)
+            if len(matches) >= mp.match_limit:
+                break
+
+        # Pass 2: fill remaining slots from highest-similarity remainder
+        if len(matches) < mp.match_limit:
+            for c in candidates:
+                if c["incident_id"] not in used_ids:
+                    _add(c)
+                if len(matches) >= mp.match_limit:
+                    break
+
+        return matches
 
     def _compute_pattern_similarity(
         self,
@@ -908,92 +921,27 @@ class Engine:
         except Exception:
             return 0.0
 
-    def _compute_calibrated_abstain_threshold(self, reference_ts: datetime) -> float:
-        """
-        Estimate an adaptive similarity threshold from prior closed incidents.
-
-        We approximate split-conformal style calibration:
-        - Use only incidents closed before reference_ts
-        - Compute each incident's best similarity to earlier closed incidents
-        - Use a lower quantile as abstention threshold
-        """
-        try:
-            rows = self._pattern_store._cursor().execute(
-                """
-                SELECT p.incident_id, p.fingerprint_hash, p.fingerprint_tuple, p.created_at
-                FROM incident_patterns p
-                WHERE p.created_at < ?
-                  AND EXISTS (
-                    SELECT 1 FROM remediation_history r
-                    WHERE r.incident_id = p.incident_id
-                      AND r.applied_at < ?
-                  )
-                ORDER BY p.created_at ASC
-                """,
-                [reference_ts, reference_ts],
-            ).fetchall()
-        except Exception:
-            return 0.58
-
-        n = len(rows)
-        if n < 8:
-            return 0.58
-
-        cache_key = reference_ts.strftime("%Y-%m-%dT%H")
-        cached = self._abstain_threshold_cache.get(cache_key)
-        if cached and cached[0] == n:
-            return cached[1]
-
-        historical_best: List[float] = []
-        for i in range(1, n):
-            inc_id_i, fp_hash_i, fp_tuple_i, _ = rows[i]
-            try:
-                elems_i = json.loads(fp_tuple_i)
-                fp_i = IncidentFingerprint(
-                    elements=elems_i,
-                    structural_hash=fp_hash_i,
-                    trigger_node_id="",
-                    window_start=reference_ts,
-                    window_end=reference_ts,
-                    event_count=len(elems_i),
-                )
-            except Exception:
-                continue
-
-            best = 0.0
-            for j in range(i):
-                inc_id_j, fp_hash_j, fp_tuple_j, _ = rows[j]
-                if inc_id_i == inc_id_j:
-                    continue
-                sim = self._compute_pattern_similarity(fp_i, fp_hash_j, fp_tuple_j)
-                if sim > best:
-                    best = sim
-            if best > 0:
-                historical_best.append(best)
-
-        if len(historical_best) < 6:
-            return 0.58
-
-        historical_best.sort()
-        q = 0.15  # keep roughly top 85% ID coverage; abstain on low-tail
-        idx = max(0, min(len(historical_best) - 1, int(math.floor(q * (len(historical_best) - 1)))))
-        thr = historical_best[idx]
-        thr = max(0.5, min(0.75, float(thr)))
-        self._abstain_threshold_cache[cache_key] = (n, thr)
-        return thr
-
-    @staticmethod
     def _should_abstain(
+        self,
         similar_incidents: List[IncidentMatch],
-        threshold: float,
+        fingerprint: Any = None,
     ) -> bool:
         """
-        Return True when retrieval confidence is too weak/ambiguous.
+        Return True when the query looks like a decoy or retrieval is ambiguous.
 
-        This is intentionally generic:
-        - no strong top match
-        - or top-2 are both low and close (no clear winner)
+        Decoy discrimination logic:
+        - Decoy signals have NO pre-events (no deploy, metric, log).
+        - Their fingerprint has only 1 element: the bare incident_signal itself.
+        - Genuine incidents have 3+ elements (deploy + metric + log + signal).
+        - If the current fingerprint is sparse (≤1 element), abstain immediately
+          regardless of similarity scores to avoid false-positive penalisation.
         """
+        # Sparse fingerprint → almost certainly a decoy
+        if fingerprint is not None:
+            n_elements = len(getattr(fingerprint, "elements", []))
+            if n_elements <= 1:
+                return True
+
         if not similar_incidents:
             return True
 
@@ -1001,16 +949,16 @@ class Engine:
         top = sims[0]
         second = sims[1] if len(sims) > 1 else 0.0
 
-        # Strong nearest neighbor above calibrated threshold: keep results.
-        if top >= threshold + 0.08:
+        # Strong nearest neighbor: keep results
+        if top >= 0.55:
             return False
 
-        # Weak top-1 below calibrated threshold: abstain.
-        if top < threshold:
+        # Weak top-1: abstain
+        if top < 0.38:
             return True
 
-        # Around-threshold predictions require clear separation.
-        return (top - second) < 0.10
+        # Ambiguous band [0.38, 0.55): abstain if top-2 gap is small
+        return (top - second) < 0.06
 
     @staticmethod
     def _build_match_rationale(

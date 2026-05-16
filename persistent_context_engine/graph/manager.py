@@ -177,6 +177,8 @@ class GraphManager:
             for n in frontier:
                 if n in visited:
                     continue
+                if n not in self._g:
+                    continue
                 next_frontier.update(self._g.successors(n))
                 next_frontier.update(self._g.predecessors(n))
             visited.update(frontier)
