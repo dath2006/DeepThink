@@ -187,7 +187,11 @@ class Engine:
         if len(related) < mp.max_events:
             window_events = self._buffer.in_window(start_ts, end_ts)
             seen_ids: set = {e.get("id") or id(e) for e in related}
+            allowed_services = set(expanded_services)
             for e in window_events:
+                svc_name = e.get("service")
+                if allowed_services and svc_name and svc_name not in allowed_services:
+                    continue
                 eid = e.get("id") or id(e)
                 if eid not in seen_ids:
                     related.append(e)
@@ -195,8 +199,12 @@ class Engine:
 
         rows = self._raw_store.get_by_timerange(start_ts, end_ts, limit=mp.max_events)
         seen_ids = {e.get("id") or id(e) for e in related}
+        allowed_services = set(expanded_services)
         for r in rows:
             ev = r["raw"]
+            ev_svc = ev.get("service")
+            if allowed_services and ev_svc and ev_svc not in allowed_services:
+                continue
             eid = ev.get("id") or id(ev)
             if eid not in seen_ids:
                 related.append(ev)
@@ -245,6 +253,7 @@ class Engine:
                 events=deduped,
                 graph_manager=self._graph,
                 node_store=self._node_store,
+                temporal_view=self._temporal_view,
                 time_bucket_minutes=mp.time_bucket_minutes,
             )
 

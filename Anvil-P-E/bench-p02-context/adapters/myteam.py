@@ -17,16 +17,17 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adapter import Adapter
-from persistent_context_engine import Engine, EngineConfig
+from persistent_context_engine import Engine as PCEngine, EngineConfig
 from schema import Context, Event, IncidentSignal
 
 
-class PersistentContextAdapter(Adapter):
+class PersistentContextAdapter(Adapter):  # also exported as Engine below
     """Benchmark adapter for the Persistent Context Engine."""
 
     def __init__(self) -> None:
         # Use in-memory DB per seed (harness constructs a fresh adapter per seed)
-        self._engine = Engine(EngineConfig(db_path=":memory:", buffer_size=500))
+        # L3 scale: 30 services × 21 days → larger buffer
+        self._engine = PCEngine(EngineConfig(db_path=":memory:", buffer_size=2000))
 
     def ingest(self, events: Iterable[Event]) -> None:
         self._engine.ingest(events)
@@ -40,3 +41,7 @@ class PersistentContextAdapter(Adapter):
 
     def close(self) -> None:
         self._engine.close()
+
+
+# Alias expected by: python run.py --adapter adapters.myteam:Engine
+Engine = PersistentContextAdapter

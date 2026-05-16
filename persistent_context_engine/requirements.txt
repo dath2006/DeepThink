@@ -6,3 +6,6 @@ duckdb>=0.10.0,<2.0.0
 
 # In-memory graph for fast traversal (UUID-keyed DiGraph)
 networkx>=3.0,<4.0
+
+# Required by benchmark run.py for aggregation
+numpy>=1.24.0

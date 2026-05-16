@@ -12,6 +12,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from collections import Counter
 
 from .schema import EventKind
 
@@ -354,18 +355,21 @@ def compute_similarity(fp1: IncidentFingerprint, fp2: IncidentFingerprint) -> fl
     if fp1.structural_hash == fp2.structural_hash:
         return 1.0
 
-    distance = fp1.edit_distance(fp2)
+    seq1 = [tuple(x) if isinstance(x, list) else x for x in fp1.elements]
+    seq2 = [tuple(x) if isinstance(x, list) else x for x in fp2.elements]
+    if not seq1 and not seq2:
+        return 0.0
 
-    if distance == 0:
-        return 1.0
-    elif distance == 1:
-        return 0.8
-    elif distance == 2:
-        return 0.6
-    elif distance <= 4:
-        return 0.4
-    else:
-        max_len = max(len(fp1.elements), len(fp2.elements))
-        if max_len == 0:
-            return 0.0
-        return max(0.0, 1.0 - (distance / max_len))
+    # Robust-to-noise multiset overlap (counts matter, order-insensitive).
+    c1 = Counter(seq1)
+    c2 = Counter(seq2)
+    common = sum(min(c1[k], c2[k]) for k in c1.keys() | c2.keys())
+    total = sum(max(c1[k], c2[k]) for k in c1.keys() | c2.keys())
+    jaccard = (common / total) if total else 0.0
+
+    # Preserve some sequential signal, but don't let it dominate.
+    distance = fp1.edit_distance(fp2)
+    max_len = max(len(seq1), len(seq2))
+    seq_score = max(0.0, 1.0 - (distance / max_len)) if max_len else 0.0
+
+    return max(0.0, min(1.0, 0.75 * jaccard + 0.25 * seq_score))

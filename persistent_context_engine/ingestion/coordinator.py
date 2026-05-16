@@ -446,13 +446,24 @@ class IngestCoordinator:
 
         # Fetch events in window (from buffer or DB)
         window_events = self._raw.get_by_timerange(
-            window_start, window_end, limit=100
+            window_start, window_end, limit=1000
         )
+
+        # Restrict fingerprint events to trigger service + immediate topology neighborhood.
+        # This prevents background noise from unrelated services from dominating hashes.
+        relevant_services = {service}
+        neighbor_ids = self._graph.neighbors_within_hops(trigger_node_id, hops=2)
+        for nid in neighbor_ids:
+            for name in self._nodes.all_names_for_id(nid):
+                relevant_services.add(name)
 
         # Build event dicts for fingerprinter
         events_for_fp = []
         for row in window_events:
             raw = row.get("raw", {})
+            raw_svc = raw.get("service")
+            if raw_svc and raw_svc not in relevant_services:
+                continue
             # Parse ts back to datetime if needed
             raw_ts = raw.get("ts")
             if isinstance(raw_ts, str):
@@ -471,6 +482,7 @@ class IngestCoordinator:
             events=events_for_fp,
             graph_manager=self._graph,
             node_store=self._nodes,
+            temporal_view=self._temporal_view,
         )
 
         # Store pattern
