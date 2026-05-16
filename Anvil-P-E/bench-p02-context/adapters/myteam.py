@@ -1,8 +1,8 @@
 """
-Adapter wrapping the Persistent Context Engine for the Anvil P-02 benchmark.
+Adapter wrapping the Persistent Context Engine for the Anvil P-02 L3 benchmark.
 
 Usage:
-    python self_check.py --adapter adapters.persistent_context:PersistentContextAdapter --quick
+    python run.py --adapter adapters.myteam:Engine --mode fast --out l3_report.json
 """
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Iterable, Literal
 
 # Add the project root to path so persistent_context_engine is importable
-# __file__ = .../Anvil-P-E/bench-p02-context/adapters/persistent_context.py
-# We need 4 parents up to reach D:\Agents\DeepThink
+# __file__ = .../Anvil-P-E/bench-p02-context/adapters/myteam.py
+# 4 parents up → D:\Agents\DeepThink (repo root)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 

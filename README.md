@@ -8,18 +8,31 @@ A persistent, graph-aware context engine for AI SRE. Ingests telemetry streams, 
 git clone https://github.com/dath2006/DeepThink.git
 cd DeepThink
 pip install -r persistent_context_engine/requirements.txt
+
+# Quick run — single seed (~30 s)
 ./bench/run.sh --quick
+
+# Full L3 canonical run (5 seeds) — report to stdout
+./bench/run.sh
+
+# Save report to file
+./bench/run.sh --out report.json
 ```
 
 ## Benchmark Runner
 
-`bench/run.sh` ingests the canonical synthetic dataset, runs the benchmark harness across 5 seeds, and emits a JSON report matching the SDK schema.
+`bench/run.sh` runs the full **L3 Final** benchmark — the canonical evaluation across 5 seeds with the stretch generator config:
+
+- **30 services** · **21 simulated days** · **80 topology mutations**
+- **Cascading renames** (services renamed 2-4× across the timeline)
+- **60 train + 25 eval incidents** across **8 incident families**
+- **20% decoy rate** — eval signals with no matching family
 
 ```bash
-# Quick iteration (2 seeds, 6 services, ~10 s)
+# Quick iteration (single seed, L3 config, ~30 s)
 ./bench/run.sh --quick
 
-# Full canonical run (5 seeds, 12 services, 7-day window) — report to stdout
+# Full canonical run (5 seeds, 30 services, 21 days) — report to stdout
 ./bench/run.sh
 
 # Full run — save JSON report to file
@@ -29,22 +42,29 @@ pip install -r persistent_context_engine/requirements.txt
 ./bench/run.sh --mode deep --out report_deep.json
 ```
 
+Or run the benchmark directly:
+
+```bash
+cd Anvil-P-E/bench-p02-context
+python run.py --adapter adapters.myteam:Engine --mode fast --out l3_report.json
+```
+
 The JSON report schema matches `harness.py` output exactly:
 
 ```json
 {
   "mode": "fast",
-  "seeds": [42, 101, 202, 303, 404],
+  "seeds": [314159, 271828, 161803, 141421, 173205],
   "per_seed": [ ... ],
   "aggregated": {
-    "recall@5": 0.8,
-    "precision@5_mean": 0.272,
-    "remediation_acc": 1.0,
-    "latency_p95_ms": 141.0,
-    "latency_mean_ms": 95.2
+    "recall@5": 0.48,
+    "precision@5_mean": 0.122,
+    "remediation_acc": 0.32,
+    "latency_p95_ms": 94.0,
+    "latency_mean_ms": 51.0
   },
   "score": {
-    "weighted_score": 0.631,
+    "weighted_score": 0.376,
     "max_automated": 0.8,
     "axes": { ... }
   }
@@ -81,17 +101,17 @@ persistent_context_engine/   # engine package
   graph/                     # NetworkX DiGraph + TemporalGraphView
   ingestion/                 # Event parser, ring buffer, ingest coordinator
 
-Anvil-P-E/bench-p02-context/ # benchmark harness (read-only — do not modify)
+Anvil-P-E/bench-p02-context/ # L3 benchmark harness (read-only — do not modify)
   schema.py                  # Event, IncidentSignal, Context TypedDicts
   adapter.py                 # Abstract Adapter base class
-  generator.py               # Deterministic synthetic telemetry generator
+  generator.py               # Deterministic synthetic telemetry generator (L3 stretch)
   harness.py                 # Multi-seed ingest + query loop + scoring
-  run.py                     # Full CLI entry point
-  self_check.py              # Local iteration entry point
+  run.py                     # Full L3 CLI entry point
   adapters/myteam.py         # Our adapter (thin wrapper around Engine)
 
 bench/run.sh                 # Canonical benchmark runner script
 Dockerfile                   # Reproducible judge environment
+test_latency_budget.py       # Local latency budget verification
 ```
 
 ## Requirements
@@ -99,17 +119,28 @@ Dockerfile                   # Reproducible judge environment
 - Python 3.11+
 - `duckdb>=0.10.0,<2.0.0`
 - `networkx>=3.0,<4.0`
+- `numpy>=1.24.0`
 
 No external services. No network access. Fully in-process.
 
-## Benchmark Scores (canonical 5-seed run)
+## Benchmark Scores — L3 Final (5 seeds, 30 svc, 21 days, cascading renames, 20% decoy)
 
 | Metric                 | Value            |
 | ---------------------- | ---------------- |
-| `recall@5`             | 0.800            |
-| `precision@5_mean`     | 0.272            |
-| `remediation_acc`      | 1.000            |
-| `latency_p95_ms`       | ≤ 141 ms         |
-| **Weighted automated** | **0.631 / 0.80** |
+| `recall@5`             | 0.480            |
+| `precision@5_mean`     | 0.122            |
+| `remediation_acc`      | 0.320            |
+| `latency_p95_ms`       | 94 ms            |
+| **Weighted automated** | **0.376 / 0.80** |
 
 Max automated score is 0.80 — the remaining 0.20 is panel-graded (`manual_context`, `manual_explain`).
+
+### Latency budget (all passing)
+
+| Test                         | Result      | Budget    |
+| ---------------------------- | ----------- | --------- |
+| Cold-start                   | ~2,625 ms   | 60,000 ms |
+| Ingest throughput            | ~11,707 e/s | 1,000 e/s |
+| Ingest lag (event→queryable) | 63 ms       | 5,000 ms  |
+| Fast p95 reconstruct         | 47 ms       | 2,000 ms  |
+| Deep p95 reconstruct         | 62 ms       | 6,000 ms  |

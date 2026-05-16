@@ -19,7 +19,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$REPO_ROOT/Anvil-P-E/bench-p02-context"
 ENGINE_DEPS="$REPO_ROOT/persistent_context_engine/requirements.txt"
-ADAPTER="adapters.myteam:PersistentContextAdapter"
+ADAPTER="adapters.myteam:Engine"
+
+# L3 canonical seeds — do NOT change without a council release
+L3_SEEDS="314159 271828 161803 141421 173205"
 
 # ---------- argument parsing ----------
 MODE="fast"
@@ -29,7 +32,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --mode)    MODE="$2";  shift 2 ;;
         --out)     OUT="$2";   shift 2 ;;
-        --quick)   QUICK="--quick"; shift ;;
+        --quick)   QUICK="1";  shift ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -42,23 +45,33 @@ pip install --quiet -r "$ENGINE_DEPS"
 cd "$BENCH_DIR"
 
 if [[ -n "$QUICK" ]]; then
-    echo "[bench/run.sh] Running quick self-check (2 seeds, 6 services) ..."
-    python self_check.py \
-        --adapter "$ADAPTER" \
-        --mode "$MODE" \
-        --quick
-else
-    echo "[bench/run.sh] Running canonical benchmark (5 seeds, 12 services, 7 days) ..."
+    # Quick: single seed, L3 stretch config (30 svc, 21 days) — ~30s
+    echo "[bench/run.sh] Running quick L3 check (1 seed, 30 services, 21 days) ..."
     if [[ "$OUT" == "-" ]]; then
         python run.py \
             --adapter "$ADAPTER" \
             --mode "$MODE" \
-            --seeds 42 101 202 303 404
+            --seeds 314159
     else
         python run.py \
             --adapter "$ADAPTER" \
             --mode "$MODE" \
-            --seeds 42 101 202 303 404 \
+            --seeds 314159 \
+            --out "$OUT"
+        echo "[bench/run.sh] Report written to $OUT"
+    fi
+else
+    echo "[bench/run.sh] Running canonical L3 benchmark (5 seeds, 30 services, 21 days) ..."
+    if [[ "$OUT" == "-" ]]; then
+        python run.py \
+            --adapter "$ADAPTER" \
+            --mode "$MODE" \
+            --seeds $L3_SEEDS
+    else
+        python run.py \
+            --adapter "$ADAPTER" \
+            --mode "$MODE" \
+            --seeds $L3_SEEDS \
             --out "$OUT"
         echo "[bench/run.sh] Report written to $OUT"
     fi
